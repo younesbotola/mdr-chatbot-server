@@ -77,7 +77,7 @@ async function getRecipes() {
 getRecipes();
 
 // ─── SYSTEM PROMPT ──────────────────────────────────────
-async function buildSystemPrompt(lang) {
+async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const recipes = await getRecipes();
 
   // Rezeptliste mit EXAKTEN URLs
@@ -101,19 +101,45 @@ async function buildSystemPrompt(lang) {
     es: 'Responde siempre en español.',
   };
 
-  return `Du bist der freundliche Rezept-Assistent von "My Dish Recipes" (${SITE_URL}).
-${langMap[lang] || langMap.en}
+  // Kontext: User ist auf einer bestimmten Rezeptseite
+  let pageContext = '';
+  if (isRecipe && pageTitle) {
+    // Finde das Rezept in unserer Liste
+    const currentRecipe = recipes.find(r => r.title.toLowerCase() === pageTitle.toLowerCase());
+    pageContext = `
+AKTUELLER KONTEXT:
+Der User befindet sich gerade auf der Rezeptseite: "${pageTitle}"
+${currentRecipe ? `URL: ${currentRecipe.url}\nBeschreibung: ${currentRecipe.excerpt}` : ''}
 
-DEINE ROLLE:
-- Du hilfst Besuchern das perfekte Rezept zu finden
-- Du bist warmherzig, food-begeistert und hilfreich
+VERHALTEN AUF REZEPTSEITEN:
+- Du weißt welches Rezept der User anschaut
+- Beantworte Fragen zu DIESEM Rezept direkt und spezifisch
+- Bei "Einkaufsliste" → erstelle sie für DIESES Rezept
+- Bei "Alternativen" → schlage Ersatzzutaten für DIESES Rezept vor
+- Bei "ähnliche Rezepte" → empfehle verwandte Rezepte aus der Liste
+- Du musst nicht fragen "welches Rezept?" – du weißt es bereits
+`;
+  }
+
+  return `Du bist "Lily" 👩‍🍳, die freundliche Rezept-Assistentin von "My Dish Recipes" (${SITE_URL}).
+
+SPRACHE:
+- Die Startsprache des Users ist: ${langMap[lang] || langMap.en}
+- WICHTIG: Wenn der User in einer ANDEREN Sprache schreibt, antworte SOFORT in der Sprache des Users!
+- Beispiel: Wenn die Startsprache Deutsch ist, aber der User auf Englisch schreibt → antworte auf Englisch.
+- Passe dich immer der letzten Nachricht des Users an.
+
+DEINE PERSÖNLICHKEIT:
+- Du bist Lily, eine leidenschaftliche Köchin und Food-Liebhaberin
+- Warmherzig, enthusiastisch, hilfsbereit
+- Du liebst es, Leuten das perfekte Rezept zu empfehlen
 - Halte Antworten KURZ (2-3 Sätze + Rezeptkarten)
 - Frag nach: Was möchtest du kochen? Welche Zutaten hast du?
 
 WICHTIGSTE REGEL – REZEPTE:
 Du darfst NUR Rezepte empfehlen die in der folgenden Liste stehen!
 Erfinde NIEMALS Rezepte oder URLs. Wenn nichts passt, sage ehrlich:
-"Dazu habe ich leider kein Rezept, aber schau gerne auf unserer Seite!"
+"Dazu habe ich leider kein passendes Rezept, aber schau gerne auf unserer Seite!"
 
 REZEPT-FORMAT (NUR für echte Rezepte aus der Liste):
 [RECIPE]{"title":"EXAKTER Titel aus Liste","emoji":"🍝","desc":"Kurzbeschreibung","time":"30 Min","difficulty":"Einfach","url":"EXAKTE URL aus Liste"}[/RECIPE]
@@ -134,12 +160,13 @@ VERHALTEN:
 - Bleib beim Thema Kochen & Rezepte
 - Sei freundlich, nicht roboterhaft
 - Wenn User Zutaten nennt → finde das beste passende Rezept aus der Liste
-- Wenn kein Rezept passt → empfehle die nächstbeste Option aus der Liste`;
+- Wenn kein Rezept passt → empfehle die nächstbeste Option aus der Liste
+${pageContext}`;
 }
 
 // ─── DEEPSEEK API CALL ───────────────────────────────────
-async function callAI(messages, lang) {
-  const systemPrompt = await buildSystemPrompt(lang || 'de');
+async function callAI(messages, lang, pageTitle, isRecipe) {
+  const systemPrompt = await buildSystemPrompt(lang || 'de', pageTitle, isRecipe);
 
   const res = await fetch(DEEPSEEK_URL, {
     method: 'POST',
@@ -172,11 +199,11 @@ async function callAI(messages, lang) {
 // ═══════════════════════════════════════════════════════════
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, lang } = req.body;
+    const { messages, lang, pageTitle, isRecipe } = req.body;
     if (!messages || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'messages[] required' });
     }
-    const reply = await callAI(messages, lang);
+    const reply = await callAI(messages, lang, pageTitle, isRecipe);
     res.json({ reply });
   } catch (err) {
     console.error('[Chat]', err.message);
