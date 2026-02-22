@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-// My Dish Recipes – Chatbot Backend v3
-// Younes Biane | SEO + Affiliate + Quality Answers
+// My Dish Recipes – Chatbot Backend v4
+// Younes Biane | SEO + Affiliate + WhatsApp + Quality Answers
 // ═══════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -21,6 +21,18 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
 const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com';
 const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`;
 const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
+
+// WhatsApp Meta Cloud API
+const META_WA_TOKEN = process.env.META_WA_TOKEN || '';
+const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || '';
+const META_WA_VERIFY = process.env.META_WA_VERIFY || 'mdr_verify_token';
+
+// WhatsApp conversation memory (in-memory, resets on deploy)
+const waConversations = new Map();
+const WA_HISTORY_MAX = 10;
+const WA_HISTORY_TTL = 30 * 60 * 1000; // 30 min
 
 // ═══════════════════════════════════════════════════════════
 // LIVE REZEPT-CACHE
@@ -37,7 +49,6 @@ async function getRecipes() {
   }
 
   try {
-    // Custom REST Route – gibt bereits saubere Daten zurück
     const res = await fetch(WP_API, { timeout: 8000 });
     if (!res.ok) throw new Error(`WP API ${res.status}`);
     const data = await res.json();
@@ -57,7 +68,6 @@ async function getRecipes() {
     console.error('[Cache] WP-Fehler:', err.message);
   }
 
-  // Auch Produkte laden wenn konfiguriert
   if (PRODUCTS_API) {
     try {
       const pres = await fetch(PRODUCTS_API, { timeout: 5000 });
@@ -80,12 +90,10 @@ getRecipes();
 async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const recipes = await getRecipes();
 
-  // Rezeptliste mit EXAKTEN URLs
   const recipeList = recipes.slice(0, 60).map(r =>
     `• "${r.title}" | URL: ${r.url} | ${r.excerpt}`
   ).join('\n');
 
-  // Produkte für Affiliate
   const productList = productsCache.length > 0
     ? '\n\nVERFÜGBARE PRODUKTE (für Empfehlungen):\n' + productsCache.map(p =>
         `• ${p.name} (Kategorie: ${p.category || 'Allgemein'}, Kontext: ${p.context || ''})`
@@ -101,10 +109,8 @@ async function buildSystemPrompt(lang, pageTitle, isRecipe) {
     es: 'Responde siempre en español.',
   };
 
-  // Kontext: User ist auf einer bestimmten Rezeptseite
   let pageContext = '';
   if (isRecipe && pageTitle) {
-    // Finde das Rezept in unserer Liste
     const currentRecipe = recipes.find(r => r.title.toLowerCase() === pageTitle.toLowerCase());
     pageContext = `
 AKTUELLER KONTEXT:
@@ -181,7 +187,7 @@ async function callAI(messages, lang, pageTitle, isRecipe) {
         ...messages.slice(-10),
       ],
       max_tokens: 800,
-      temperature: 0.5,  // Etwas weniger kreativ = genauer
+      temperature: 0.5,
     }),
   });
 
@@ -212,6 +218,419 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
+// ROUTE: Voice (ElevenLabs TTS)
+// ═══════════════════════════════════════════════════════════
+app.post('/api/voice', async (req, res) => {
+  try {
+    const { text, lang } = req.body;
+    if (!text || !ELEVENLABS_KEY) {
+      return res.status(400).json({ error: 'Voice not configured' });
+    }
+
+    const shortText = text.slice(0, 500);
+
+    const ttsRes = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'xi-api-key': ELEVENLABS_KEY,
+        },
+        body: JSON.stringify({
+          text: shortText,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.3,
+          },
+        }),
+      }
+    );
+
+    if (!ttsRes.ok) {
+      const err = await ttsRes.text();
+      console.error('[Voice] ElevenLabs error:', err);
+      return res.status(500).json({ error: 'TTS failed' });
+    }
+
+    res.set('Content-Type', 'audio/mpeg');
+    const buffer = await ttsRes.buffer();
+    res.send(buffer);
+
+  } catch (err) {
+    console.error('[Voice]', err.message);
+    res.status(500).json({ error: 'Voice error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// ROUTE: WhatsApp Webhook (Meta Cloud API)
+// ═══════════════════════════════════════════════════════════
+
+// Webhook Verification (GET)
+app.get('/api/whatsapp', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === META_WA_VERIFY) {
+    console.log('[WA] Webhook verified');
+    return res.status(200).send(challenge);
+  }
+  res.status(403).send('Forbidden');
+});
+
+// Webhook Handler (POST) – empfängt Nachrichten
+app.post('/api/whatsapp', async (req, res) => {
+  // Sofort 200 an Meta zurück (sonst Retry-Schleife)
+  res.status(200).send('OK');
+
+  try {
+    let entry, value, msg, from, name;
+    const raw = req.body?.raw_webhook || req.body;
+    const settings = {
+      chatLimit: req.body?.chat_limit || 0,
+    };
+
+    entry = raw?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    value = changes?.value;
+    if (!value?.messages?.[0]) return;
+
+    msg = value.messages[0];
+    from = msg.from;
+    name = value.contacts?.[0]?.profile?.name || '';
+    const type = msg.type;
+
+    let userText = '';
+    if (type === 'text') {
+      userText = msg.text?.body || '';
+    } else if (type === 'audio') {
+      userText = '[Der User hat eine Sprachnachricht gesendet. Antworte freundlich, frage was du helfen kannst. Erwähne dass du leider noch keine Sprachnachrichten verstehen kannst, aber gerne Textfragen beantwortest.]';
+    } else if (type === 'interactive') {
+      userText = msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || '';
+    } else {
+      userText = '[Nachricht vom Typ: ' + type + ']';
+    }
+    if (!userText) return;
+
+    // Abo-Check
+    const lower = userText.toLowerCase().trim();
+    if (['stop','quit','abmelden','unsubscribe','abbestellen','arrêter','parar','durdur'].includes(lower)) {
+      await sendWhatsApp(from, '✅ Du wurdest abgemeldet. Schreibe jederzeit "Hallo" um wieder dabei zu sein! 👋');
+      try {
+        await fetch(`${SITE_URL}/wp-json/mdr-chatbot/v1/wa/unsubscribe`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({phone:from}), timeout:5000,
+        });
+      } catch(e) {}
+      return;
+    }
+
+    // Chat-Limit prüfen
+    if (settings.chatLimit > 0) {
+      const conv = waConversations.get(from);
+      if (conv) {
+        const today = new Date().toDateString();
+        if (!conv.dailyCount || conv.dailyDate !== today) {
+          conv.dailyCount = 0;
+          conv.dailyDate = today;
+        }
+        conv.dailyCount++;
+        if (conv.dailyCount > settings.chatLimit) {
+          const lang = detectLangFromPhone(from);
+          const limitMsgs = {
+            de: `⏳ Du hast dein Tageslimit von ${settings.chatLimit} Nachrichten erreicht. Morgen geht es weiter!`,
+            en: `⏳ You've reached your daily limit of ${settings.chatLimit} messages. Try again tomorrow!`,
+            tr: `⏳ Günlük ${settings.chatLimit} mesaj limitine ulaştınız. Yarın tekrar deneyin!`,
+            ar: `⏳ لقد وصلت إلى الحد اليومي (${settings.chatLimit} رسالة). حاول مرة أخرى غداً!`,
+            fr: `⏳ Vous avez atteint votre limite de ${settings.chatLimit} messages. Réessayez demain !`,
+            es: `⏳ Has alcanzado tu límite de ${settings.chatLimit} mensajes. ¡Inténtalo mañana!`,
+          };
+          await sendWhatsApp(from, limitMsgs[lang] || limitMsgs.en);
+          return;
+        }
+      }
+    }
+
+    // Auto-Subscribe bei WordPress
+    const phoneLang = detectLangFromPhone(from);
+    try {
+      await fetch(`${SITE_URL}/wp-json/mdr-chatbot/v1/wa/subscribe`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({phone:from, name:name, lang:phoneLang}), timeout:5000,
+      });
+    } catch(e) {}
+
+    // Conversation History
+    if (!waConversations.has(from)) {
+      waConversations.set(from, { msgs:[], ts:Date.now(), dailyCount:1, dailyDate:new Date().toDateString() });
+    }
+    const conv = waConversations.get(from);
+    conv.ts = Date.now();
+    conv.msgs.push({ role:'user', content:userText });
+    if (conv.msgs.length > WA_HISTORY_MAX) conv.msgs = conv.msgs.slice(-WA_HISTORY_MAX);
+
+    // Sprache: erst aus Text erkennen, Fallback Vorwahl
+    const textLang = detectLang(userText);
+    const lang = textLang || phoneLang;
+
+    // AI Antwort
+    const systemPrompt = await buildSystemPrompt(lang, '', false);
+    const waSystemPrompt = systemPrompt + `
+
+WHATSAPP-MODUS:
+- Du antwortest via WhatsApp, NICHT im Web-Chat
+- WICHTIG: Antworte IMMER in der Sprache der letzten Nachricht des Users!
+- Wenn User Deutsch schreibt → Deutsch. Englisch → Englisch. Türkisch → Türkisch. Etc.
+- Halte Antworten KURZ (max 3-4 Sätze)
+- KEINE [RECIPE], [SHOPLIST], [PRODUCT] Tags – nur einfacher Text
+- Rezept-Links als vollständige URL: ${SITE_URL}/rezept-slug/
+- Einkaufslisten als • Aufzählung
+- Der User heißt: ${name || 'unbekannt'}
+- Wenn jemand "Hallo"/"Hi"/"Merhaba"/"مرحبا" sagt → Begrüße freundlich in SEINER Sprache, frage was er kochen möchte
+- Sage beim ersten Kontakt: Man kann "stop" schreiben zum Abmelden`;
+
+    const aiRes = await fetch(DEEPSEEK_URL, {
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':`Bearer ${DEEPSEEK_KEY}`},
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        messages: [
+          {role:'system', content:waSystemPrompt},
+          ...conv.msgs.slice(-8),
+        ],
+        max_tokens: 500, temperature: 0.5,
+      }),
+    });
+
+    if (!aiRes.ok) throw new Error(`DeepSeek ${aiRes.status}`);
+    const aiData = await aiRes.json();
+    let reply = aiData.choices[0].message.content;
+
+    // Tags entfernen
+    reply = reply.replace(/\[RECIPE\].*?\[\/RECIPE\]/gs,'')
+                 .replace(/\[SHOPLIST\].*?\[\/SHOPLIST\]/gs,'')
+                 .replace(/\[PRODUCT\].*?\[\/PRODUCT\]/gs,'')
+                 .trim();
+
+    conv.msgs.push({role:'assistant',content:reply});
+    await sendWhatsApp(from, reply);
+
+  } catch (err) {
+    console.error('[WA] Error:', err.message);
+  }
+});
+
+// WhatsApp Broadcast Endpoint (von WordPress Cron aufgerufen)
+app.post('/api/wa/broadcast', async (req, res) => {
+  try {
+    const { type, recipes, subscribers, pinned_product } = req.body;
+    if (!subscribers || !Array.isArray(subscribers)) {
+      return res.status(400).json({ error: 'subscribers[] required' });
+    }
+
+    let sent = 0;
+
+    if (type === 'weekly_recipes' && recipes) {
+      for (const sub of subscribers) {
+        const phone = sub.phone || sub;
+        const lang = sub.lang || 'en';
+        try {
+          let msg = buildRecipeBroadcast(recipes, lang);
+          await sendWhatsApp(phone, msg);
+          sent++;
+          await new Promise(r => setTimeout(r, 100));
+        } catch(e) {
+          console.error(`[WA Broadcast] Failed ${phone}:`, e.message);
+        }
+      }
+    }
+    else if (type === 'weekly_affiliate') {
+      for (const sub of subscribers) {
+        const phone = sub.phone || sub;
+        const lang = sub.lang || 'en';
+        try {
+          let msg = '';
+          if (pinned_product && pinned_product.trim()) {
+            msg = buildPinnedProductMsg(pinned_product, lang);
+          } else {
+            const allRecipes = await getRecipes();
+            const latest = allRecipes.slice(0,3).map(r=>r.title).join(', ');
+            const langInstructions = {
+              de:'auf Deutsch',en:'in English',tr:'Türkçe',ar:'بالعربية',
+              fr:'en français',es:'en español',
+            };
+            const aiRes = await fetch(DEEPSEEK_URL, {
+              method:'POST',
+              headers:{'Content-Type':'application/json','Authorization':`Bearer ${DEEPSEEK_KEY}`},
+              body:JSON.stringify({
+                model:DEEPSEEK_MODEL,
+                messages:[{
+                  role:'user',
+                  content:`Erstelle eine kurze WhatsApp-Nachricht (max 3 Sätze) ${langInstructions[lang]||langInstructions.en} die EIN nützliches Küchenprodukt empfiehlt das zu diesen Rezepten passt: ${latest}. Natürlich, nicht werblich. 1-2 Emojis. Keine Links.`
+                }],
+                max_tokens:200, temperature:0.7,
+              }),
+            });
+            const aiData = await aiRes.json();
+            msg = aiData.choices?.[0]?.message?.content || '';
+          }
+          if (msg) {
+            const stopMsg = {de:'"stop" zum Abmelden',en:'"stop" to unsubscribe',tr:'"stop" abonelikten çıkmak için',ar:'"stop" لإلغاء الاشتراك',fr:'"stop" pour se désabonner',es:'"stop" para cancelar'};
+            msg += `\n\n_${stopMsg[lang]||stopMsg.en}_`;
+            await sendWhatsApp(phone, msg);
+            sent++;
+          }
+          await new Promise(r => setTimeout(r, 100));
+        } catch(e) {
+          console.error(`[WA Affiliate] Failed ${phone}:`, e.message);
+        }
+      }
+    }
+
+    console.log(`[WA Broadcast] ${type}: ${sent}/${subscribers.length}`);
+    res.json({ sent, total: subscribers.length });
+
+  } catch (err) {
+    console.error('[WA Broadcast]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Rezept-Broadcast mehrsprachig
+ */
+function buildRecipeBroadcast(recipes, lang) {
+  const headers = {
+    de:'🍽️ *Rezepte der Woche!*', en:'🍽️ *Recipes of the Week!*',
+    tr:'🍽️ *Haftanın Tarifleri!*', ar:'🍽️ *وصفات الأسبوع!*',
+    fr:'🍽️ *Recettes de la Semaine !*', es:'🍽️ *Recetas de la Semana!*',
+  };
+  const footers = {
+    de:'_Antworte mit einer Nummer für mehr Infos! "stop" zum Abmelden_',
+    en:'_Reply with a number for more info! "stop" to unsubscribe_',
+    tr:'_Daha fazla bilgi için bir numara ile yanıtlayın! "stop" abonelikten çıkmak için_',
+    ar:'_رد برقم للمزيد من المعلومات! "stop" لإلغاء الاشتراك_',
+    fr:'_Répondez avec un numéro pour plus d\'infos ! "stop" pour se désabonner_',
+    es:'_Responde con un número para más info! "stop" para cancelar_',
+  };
+  let msg = (headers[lang]||headers.en) + '\n\n';
+  recipes.forEach((r,i) => {
+    msg += `${i+1}. *${r.title}*\n${r.excerpt}\n👉 ${r.url}\n\n`;
+  });
+  msg += footers[lang]||footers.en;
+  return msg;
+}
+
+/**
+ * Fixiertes Produkt als Message formatieren
+ */
+function buildPinnedProductMsg(pinned, lang) {
+  const lines = pinned.trim().split('\n').filter(Boolean);
+  const first = lines[0];
+  const parts = first.split('|').map(s=>s.trim());
+  const name = parts[0] || '';
+  const link = parts[1] || '';
+  const intros = {
+    de:`💡 *Küchentipp der Woche:* ${name}`,
+    en:`💡 *Kitchen tip of the week:* ${name}`,
+    tr:`💡 *Haftanın mutfak ipucu:* ${name}`,
+    ar:`💡 *نصيحة المطبخ هذا الأسبوع:* ${name}`,
+    fr:`💡 *Astuce cuisine de la semaine :* ${name}`,
+    es:`💡 *Consejo de cocina de la semana:* ${name}`,
+  };
+  let msg = intros[lang]||intros.en;
+  if (link) msg += `\n👉 ${link}`;
+  return msg;
+}
+
+/**
+ * Meta Cloud API: Nachricht senden
+ */
+async function sendWhatsApp(to, text) {
+  if (!META_WA_TOKEN || !META_WA_PHONE_ID) {
+    console.error('[WA] Not configured: missing TOKEN or PHONE_ID');
+    return;
+  }
+
+  const msg = text.slice(0, 4000);
+
+  const res = await fetch(
+    `https://graph.facebook.com/v21.0/${META_WA_PHONE_ID}/messages`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${META_WA_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: to,
+        type: 'text',
+        text: { body: msg },
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Meta WA API ${res.status}: ${err}`);
+  }
+  return res.json();
+}
+
+/**
+ * Sprache aus Telefon-Vorwahl erkennen
+ */
+function detectLangFromPhone(phone) {
+  const clean = (phone||'').replace(/\D/g,'');
+  const map = {
+    '49':'de','43':'de','41':'de',
+    '1':'en','44':'en','61':'en',
+    '90':'tr',
+    '966':'ar','971':'ar','20':'ar','212':'ar','213':'ar','216':'ar',
+    '33':'fr','32':'fr',
+    '34':'es','52':'es','54':'es',
+    '55':'pt','351':'pt',
+    '39':'it','31':'nl',
+    '81':'ja','82':'ko','86':'zh',
+    '91':'hi','62':'id','66':'th',
+  };
+  for (const len of [3,2,1]) {
+    const pre = clean.substring(0, len);
+    if (map[pre]) return map[pre];
+  }
+  return 'en';
+}
+
+/**
+ * Einfache Spracherkennung aus Text
+ */
+function detectLang(text) {
+  const t = (text || '').toLowerCase();
+  if (/[äöüß]|hallo|bitte|danke|rezept/i.test(t)) return 'de';
+  if (/[şçğıö]|merhaba|tarif/i.test(t)) return 'tr';
+  if (/[\u0600-\u06FF]/.test(t)) return 'ar';
+  if (/bonjour|recette|merci/i.test(t)) return 'fr';
+  if (/hola|receta|gracias/i.test(t)) return 'es';
+  return 'en';
+}
+
+// Cleanup alte WhatsApp Conversations (alle 10 Min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, conv] of waConversations) {
+    if (now - conv.ts > WA_HISTORY_TTL) waConversations.delete(phone);
+  }
+}, 10 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════════
 // ROUTE: Health
 // ═══════════════════════════════════════════════════════════
 app.get('/api/health', async (req, res) => {
@@ -221,7 +640,9 @@ app.get('/api/health', async (req, res) => {
     recipes: recipes.length,
     products: productsCache.length,
     cacheAge: Math.round((Date.now() - cacheTimestamp) / 1000) + 's',
-    version: '3.0.0',
+    version: '4.0.0',
+    whatsapp: META_WA_TOKEN ? 'configured' : 'not configured',
+    wa_conversations: waConversations.size,
   });
 });
 
@@ -237,8 +658,9 @@ app.get('/api/recipes', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`
   ┌──────────────────────────────────────┐
-  │  🍽️  My Dish Recipes Chatbot v3      │
+  │  🍽️  My Dish Recipes Chatbot v4      │
   │  Port: ${PORT}                             │
   │  API:  ${WP_API.slice(0, 32)}...  │
+  │  WA:   ${META_WA_TOKEN ? '✅ Connected' : '❌ Not configured'}              │
   └──────────────────────────────────────┘`);
 });
