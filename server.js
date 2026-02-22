@@ -1,13 +1,12 @@
 // ═══════════════════════════════════════════════════════════
-// My Dish Recipes – Chatbot Backend v2
-// Smart, günstig, live Rezepte, WhatsApp-Benachrichtigungen
+// My Dish Recipes – Chatbot Backend v3
+// Younes Biane | SEO + Affiliate + Quality Answers
 // ═══════════════════════════════════════════════════════════
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-const twilio = require('twilio');
 
 const app = express();
 app.use(cors());
@@ -19,20 +18,17 @@ const PORT = process.env.PORT || 3000;
 const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;
 const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions';
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
-const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_WA = process.env.TWILIO_WHATSAPP_NUMBER || 'whatsapp:+14155238886';
 const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com';
-const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/wp/v2`;
-
-const twilioClient = TWILIO_SID ? twilio(TWILIO_SID, TWILIO_TOKEN) : null;
+const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`;
+const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';
 
 // ═══════════════════════════════════════════════════════════
-// LIVE REZEPT-CACHE (spart API-Kosten + hält alles aktuell)
+// LIVE REZEPT-CACHE
 // ═══════════════════════════════════════════════════════════
 let recipesCache = [];
+let productsCache = [];
 let cacheTimestamp = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 Minuten – fängt neue Rezepte schnell
+const CACHE_TTL = 5 * 60 * 1000; // 5 Minuten
 
 async function getRecipes() {
   const now = Date.now();
@@ -41,25 +37,17 @@ async function getRecipes() {
   }
 
   try {
-    // WordPress REST API – Rezepte laden
-    // Passe die URL an dein Setup an (Custom Post Type, Kategorien, etc.)
-    const res = await fetch(
-      `${WP_API}/posts?per_page=100&orderby=date&order=desc&_fields=id,title,slug,excerpt,date,categories,tags,featured_media`,
-      { timeout: 5000 }
-    );
-
+    // Custom REST Route – gibt bereits saubere Daten zurück
+    const res = await fetch(WP_API, { timeout: 8000 });
     if (!res.ok) throw new Error(`WP API ${res.status}`);
-    const posts = await res.json();
+    const data = await res.json();
 
-    recipesCache = posts.map(p => ({
-      id: p.id,
-      title: p.title?.rendered || '',
-      slug: p.slug,
-      url: `/${p.slug}`,
-      excerpt: (p.excerpt?.rendered || '').replace(/<[^>]*>/g, '').trim().slice(0, 120),
-      date: p.date,
-      categories: p.categories || [],
-      tags: p.tags || [],
+    recipesCache = (data.recipes || []).map(r => ({
+      id: r.id,
+      title: r.title || '',
+      url: r.url || '',
+      excerpt: (r.excerpt || '').slice(0, 150),
+      date: r.date,
     }));
 
     cacheTimestamp = now;
@@ -67,7 +55,19 @@ async function getRecipes() {
 
   } catch (err) {
     console.error('[Cache] WP-Fehler:', err.message);
-    // Bei Fehler: alten Cache behalten, kein Crash
+  }
+
+  // Auch Produkte laden wenn konfiguriert
+  if (PRODUCTS_API) {
+    try {
+      const pres = await fetch(PRODUCTS_API, { timeout: 5000 });
+      if (pres.ok) {
+        const pdata = await pres.json();
+        productsCache = pdata.products || [];
+      }
+    } catch (e) {
+      console.error('[Cache] Produkte-Fehler:', e.message);
+    }
   }
 
   return recipesCache;
@@ -76,52 +76,65 @@ async function getRecipes() {
 // Beim Start einmal laden
 getRecipes();
 
-// ─── SYSTEM PROMPT BUILDER (dynamisch mit aktuellen Rezepten) ──
+// ─── SYSTEM PROMPT ──────────────────────────────────────
 async function buildSystemPrompt(lang) {
   const recipes = await getRecipes();
-  const recipeList = recipes.slice(0, 50).map(r =>
-    `- "${r.title}" → ${r.url} (${r.excerpt})`
+
+  // Rezeptliste mit EXAKTEN URLs
+  const recipeList = recipes.slice(0, 60).map(r =>
+    `• "${r.title}" | URL: ${r.url} | ${r.excerpt}`
   ).join('\n');
 
-  const langInstructions = {
-    de: 'Antworte auf Deutsch.',
-    en: 'Reply in English.',
-    tr: 'Türkçe cevap ver.',
-    ar: 'أجب بالعربية.',
-    fr: 'Réponds en français.',
-    es: 'Responde en español.',
+  // Produkte für Affiliate
+  const productList = productsCache.length > 0
+    ? '\n\nVERFÜGBARE PRODUKTE (für Empfehlungen):\n' + productsCache.map(p =>
+        `• ${p.name} (Kategorie: ${p.category || 'Allgemein'}, Kontext: ${p.context || ''})`
+      ).join('\n')
+    : '';
+
+  const langMap = {
+    de: 'Antworte immer auf Deutsch.',
+    en: 'Always reply in English.',
+    tr: 'Her zaman Türkçe cevap ver.',
+    ar: 'أجب دائماً بالعربية.',
+    fr: 'Réponds toujours en français.',
+    es: 'Responde siempre en español.',
   };
 
-  return `Du bist der Rezept-Assistent von "My Dish Recipes" (${SITE_URL}).
-${langInstructions[lang] || langInstructions.en}
+  return `Du bist der freundliche Rezept-Assistent von "My Dish Recipes" (${SITE_URL}).
+${langMap[lang] || langMap.en}
 
-PERSÖNLICHKEIT:
-- Freundlich, warmherzig, food-begeistert
-- Frag zuerst: "Worauf hast du Appetit?" oder "Welche Zutaten hast du?"
-- Halte Antworten kurz (2-3 Sätze + Rezeptkarten)
+DEINE ROLLE:
+- Du hilfst Besuchern das perfekte Rezept zu finden
+- Du bist warmherzig, food-begeistert und hilfreich
+- Halte Antworten KURZ (2-3 Sätze + Rezeptkarten)
+- Frag nach: Was möchtest du kochen? Welche Zutaten hast du?
 
-FÄHIGKEITEN:
-1. REZEPTE EMPFEHLEN basierend auf: Zutaten, Wünschen (leicht/deftig/schnell), Anlass, Ernährung
-2. EINKAUFSLISTE erstellen für jedes Rezept
-3. KOCHTIPPS geben
-4. ZUTATEN-BASIERTE SUCHE: User nennt was er hat → du findest passende Rezepte
+WICHTIGSTE REGEL – REZEPTE:
+Du darfst NUR Rezepte empfehlen die in der folgenden Liste stehen!
+Erfinde NIEMALS Rezepte oder URLs. Wenn nichts passt, sage ehrlich:
+"Dazu habe ich leider kein Rezept, aber schau gerne auf unserer Seite!"
 
-FORMAT für Rezeptempfehlungen (IMMER nutzen):
-[RECIPE]{"title":"Name","emoji":"🍝","desc":"Kurze Beschreibung","time":"30 Min","difficulty":"Einfach","url":"/slug"}[/RECIPE]
+REZEPT-FORMAT (NUR für echte Rezepte aus der Liste):
+[RECIPE]{"title":"EXAKTER Titel aus Liste","emoji":"🍝","desc":"Kurzbeschreibung","time":"30 Min","difficulty":"Einfach","url":"EXAKTE URL aus Liste"}[/RECIPE]
 
-FORMAT für Einkaufslisten:
+EINKAUFSLISTEN-FORMAT:
 [SHOPLIST]{"title":"Einkaufsliste für X","items":["200g Spaghetti","4 Eier","150g Speck"]}[/SHOPLIST]
 
-AKTUELLE REZEPTE (Empfehle NUR aus dieser Liste):
-${recipeList}
+${productList ? `PRODUKT-FORMAT (nur wenn es zum Rezept passt, NICHT bei jeder Antwort):
+[PRODUCT]{"name":"Produktname","emoji":"🍳","reason":"Warum es passt","url":"AFFILIATE_URL"}[/PRODUCT]` : ''}
 
-REGELN:
-- Empfehle NUR Rezepte die in der Liste oben stehen
-- Die URL muss exakt stimmen
+DEINE REZEPTE (empfehle NUR aus dieser Liste, URLs EXAKT übernehmen):
+${recipeList || 'Keine Rezepte verfügbar.'}
+
+VERHALTEN:
 - Maximal 3 Rezepte pro Antwort
-- Bei "Einkaufsliste" → erstelle sie mit [SHOPLIST]
-- Bleib beim Thema Kochen/Rezepte
-- Wenn jemand Zutaten nennt, finde das beste passende Rezept`;
+- URLs MÜSSEN exakt aus der Liste übernommen werden
+- Bei "Einkaufsliste" → erstelle mit [SHOPLIST]
+- Bleib beim Thema Kochen & Rezepte
+- Sei freundlich, nicht roboterhaft
+- Wenn User Zutaten nennt → finde das beste passende Rezept aus der Liste
+- Wenn kein Rezept passt → empfehle die nächstbeste Option aus der Liste`;
 }
 
 // ─── DEEPSEEK API CALL ───────────────────────────────────
@@ -138,10 +151,10 @@ async function callAI(messages, lang) {
       model: DEEPSEEK_MODEL,
       messages: [
         { role: 'system', content: systemPrompt },
-        ...messages.slice(-10), // Nur letzte 10 Nachrichten → spart Tokens
+        ...messages.slice(-10),
       ],
-      max_tokens: 600,   // Kurze Antworten = günstig
-      temperature: 0.6,
+      max_tokens: 800,
+      temperature: 0.5,  // Etwas weniger kreativ = genauer
     }),
   });
 
@@ -172,218 +185,33 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: WhatsApp Webhook (Twilio)
-// ═══════════════════════════════════════════════════════════
-const waSessions = new Map();
-const WA_MAX_HISTORY = 16;
-
-app.post('/api/whatsapp', async (req, res) => {
-  try {
-    const msg = req.body.Body;
-    const from = req.body.From;
-    if (!msg || !from) return res.status(400).end();
-
-    console.log(`[WA] ${from}: ${msg}`);
-
-    // Session
-    if (!waSessions.has(from)) waSessions.set(from, []);
-    const hist = waSessions.get(from);
-    hist.push({ role: 'user', content: msg });
-    if (hist.length > WA_MAX_HISTORY) hist.splice(0, hist.length - WA_MAX_HISTORY);
-
-    // Sprache aus Nachricht erraten (einfach)
-    const lang = detectMsgLang(msg);
-
-    const reply = await callAI(hist, lang);
-    hist.push({ role: 'assistant', content: reply });
-
-    // Format für WhatsApp
-    const waReply = formatWA(reply);
-
-    if (twilioClient) {
-      await twilioClient.messages.create({
-        from: TWILIO_WA,
-        to: from,
-        body: waReply,
-      });
-    }
-
-    res.set('Content-Type', 'text/xml');
-    res.send('<Response></Response>');
-
-  } catch (err) {
-    console.error('[WA]', err.message);
-    res.set('Content-Type', 'text/xml');
-    res.send('<Response></Response>');
-  }
-});
-
-// ═══════════════════════════════════════════════════════════
-// WhatsApp: Neue Rezepte benachrichtigen
-// ═══════════════════════════════════════════════════════════
-
-// Subscriber-Liste (in Produktion: Datenbank nutzen!)
-const waSubscribers = new Set();
-let lastKnownRecipeId = null;
-
-// User kann sich anmelden mit "SUBSCRIBE" / abmelden mit "STOP"
-app.post('/api/whatsapp', (req, res, next) => {
-  const msg = (req.body.Body || '').trim().toUpperCase();
-  const from = req.body.From;
-
-  if (msg === 'SUBSCRIBE' || msg === 'START') {
-    waSubscribers.add(from);
-    if (twilioClient) {
-      twilioClient.messages.create({
-        from: TWILIO_WA, to: from,
-        body: '✅ Du bekommst jetzt Benachrichtigungen über neue Rezepte! Sende STOP zum Abmelden.',
-      });
-    }
-    res.set('Content-Type', 'text/xml');
-    return res.send('<Response></Response>');
-  }
-
-  if (msg === 'STOP' || msg === 'UNSUBSCRIBE') {
-    waSubscribers.delete(from);
-    if (twilioClient) {
-      twilioClient.messages.create({
-        from: TWILIO_WA, to: from,
-        body: '👋 Benachrichtigungen deaktiviert. Sende START um sie wieder zu aktivieren.',
-      });
-    }
-    res.set('Content-Type', 'text/xml');
-    return res.send('<Response></Response>');
-  }
-
-  next(); // Weiter zum normalen Chat-Handler
-});
-
-// Periodisch prüfen ob neue Rezepte da sind (alle 15 Minuten)
-setInterval(async () => {
-  if (!twilioClient || waSubscribers.size === 0) return;
-
-  try {
-    const recipes = await getRecipes();
-    if (recipes.length === 0) return;
-
-    const newest = recipes[0]; // Sortiert nach Datum DESC
-    if (lastKnownRecipeId === null) {
-      lastKnownRecipeId = newest.id;
-      return;
-    }
-
-    if (newest.id !== lastKnownRecipeId) {
-      // Neues Rezept gefunden!
-      lastKnownRecipeId = newest.id;
-      const msg = `🍽️ *Neues Rezept!*\n\n` +
-        `*${newest.title}*\n` +
-        `${newest.excerpt}\n\n` +
-        `👉 ${SITE_URL}${newest.url}\n\n` +
-        `_Sende STOP um Benachrichtigungen zu deaktivieren._`;
-
-      for (const sub of waSubscribers) {
-        try {
-          await twilioClient.messages.create({
-            from: TWILIO_WA, to: sub, body: msg,
-          });
-          console.log(`[WA-Notify] Sent to ${sub}`);
-        } catch (e) {
-          console.error(`[WA-Notify] Failed for ${sub}:`, e.message);
-          // Bei Fehler ggf. Subscriber entfernen
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[WA-Notify]', err.message);
-  }
-}, 15 * 60 * 1000); // alle 15 Min
-
-// ═══════════════════════════════════════════════════════════
-// ROUTE: Widget Ein/Aus (Admin-Toggle)
-// ═══════════════════════════════════════════════════════════
-let widgetEnabled = true;
-
-app.get('/api/widget/status', (req, res) => {
-  res.json({ enabled: widgetEnabled });
-});
-
-// Einfacher Admin-Toggle (in Produktion: Auth hinzufügen!)
-app.post('/api/widget/toggle', (req, res) => {
-  const { secret } = req.body;
-  if (secret !== process.env.ADMIN_SECRET) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-  widgetEnabled = !widgetEnabled;
-  console.log(`[Widget] ${widgetEnabled ? 'ENABLED' : 'DISABLED'}`);
-  res.json({ enabled: widgetEnabled });
-});
-
-// ═══════════════════════════════════════════════════════════
 // ROUTE: Health
 // ═══════════════════════════════════════════════════════════
 app.get('/api/health', async (req, res) => {
   const recipes = await getRecipes();
   res.json({
     status: 'ok',
-    widget: widgetEnabled,
     recipes: recipes.length,
-    waSubscribers: waSubscribers.size,
+    products: productsCache.length,
     cacheAge: Math.round((Date.now() - cacheTimestamp) / 1000) + 's',
+    version: '3.0.0',
   });
 });
 
-// ─── HELPERS ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+// ROUTE: Rezepte-Liste (Debug)
+// ═══════════════════════════════════════════════════════════
+app.get('/api/recipes', async (req, res) => {
+  const recipes = await getRecipes();
+  res.json({ count: recipes.length, recipes: recipes.slice(0, 10) });
+});
 
-function formatWA(reply) {
-  const rr = /\[RECIPE\](.*?)\[\/RECIPE\]/gs;
-  const sr = /\[SHOPLIST\](.*?)\[\/SHOPLIST\]/gs;
-  const recipes = [], shops = [];
-  let m;
-  while ((m = rr.exec(reply)) !== null) try { recipes.push(JSON.parse(m[1])); } catch(e) {}
-  while ((m = sr.exec(reply)) !== null) try { shops.push(JSON.parse(m[1])); } catch(e) {}
-
-  let text = reply.replace(rr, '').replace(sr, '').trim();
-
-  if (recipes.length > 0) {
-    text += '\n';
-    recipes.forEach(r => {
-      text += `\n${r.emoji || '🍽️'} *${r.title}*\n`;
-      if (r.desc) text += `${r.desc}\n`;
-      text += `⏱ ${r.time || ''} · 📊 ${r.difficulty || ''}\n`;
-      text += `👉 ${SITE_URL}${r.url}\n`;
-    });
-  }
-
-  if (shops.length > 0) {
-    shops.forEach(s => {
-      text += `\n🛒 *${s.title || 'Einkaufsliste'}*\n`;
-      (s.items || []).forEach(i => { text += `☐ ${i}\n`; });
-    });
-  }
-
-  return text;
-}
-
-// Einfache Spracherkennung anhand häufiger Wörter
-function detectMsgLang(msg) {
-  const m = msg.toLowerCase();
-  if (/\b(ich|und|oder|das|mit|ein|was|hast|habe|kochen|rezept|zutaten)\b/.test(m)) return 'de';
-  if (/[\u0600-\u06FF]/.test(m)) return 'ar';
-  if (/\b(ben|bir|ve|ne|var|yemek|tarif)\b/.test(m)) return 'tr';
-  if (/\b(je|les|des|une|avec|recette)\b/.test(m)) return 'fr';
-  if (/\b(yo|los|las|una|con|receta|quiero)\b/.test(m)) return 'es';
-  return 'en';
-}
-
-// ─── STATIC + START ──────────────────────────────────────
-app.use(express.static('public'));
-
+// ─── START ───────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`
   ┌──────────────────────────────────────┐
-  │  🍽️  My Dish Recipes Chatbot v2      │
+  │  🍽️  My Dish Recipes Chatbot v3      │
   │  Port: ${PORT}                             │
-  │  Widget: ${widgetEnabled ? 'ON' : 'OFF'}                          │
-  │  WP API: ${WP_API}  │
+  │  API:  ${WP_API.slice(0, 32)}...  │
   └──────────────────────────────────────┘`);
 });
