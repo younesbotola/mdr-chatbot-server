@@ -1,6 +1,6 @@
 {
   "name": "mdr-chatbot-server",
-  "version": "4.0.0",
+  "version": "3.0.0",
   "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
