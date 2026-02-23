@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-// My Dish Recipes – Chatbot Backend v4
-// Younes Biane | SEO + Affiliate + WhatsApp + Quality Answers
+// My Dish Recipes – Chatbot Backend v3
+// Younes Biane | SEO + Affiliate + Quality Answers
 // ═══════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -30,7 +30,7 @@ const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || '';
 const META_WA_VERIFY = process.env.META_WA_VERIFY || 'mdr_verify_token';
 
 // WhatsApp conversation memory (in-memory, resets on deploy)
-const waConversations = new Map();
+const waConversations = new Map(); // phone → [{role,content}]
 const WA_HISTORY_MAX = 10;
 const WA_HISTORY_TTL = 30 * 60 * 1000; // 30 min
 
@@ -49,6 +49,7 @@ async function getRecipes() {
   }
 
   try {
+    // Custom REST Route – gibt bereits saubere Daten zurück
     const res = await fetch(WP_API, { timeout: 8000 });
     if (!res.ok) throw new Error(`WP API ${res.status}`);
     const data = await res.json();
@@ -68,6 +69,7 @@ async function getRecipes() {
     console.error('[Cache] WP-Fehler:', err.message);
   }
 
+  // Auch Produkte laden wenn konfiguriert
   if (PRODUCTS_API) {
     try {
       const pres = await fetch(PRODUCTS_API, { timeout: 5000 });
@@ -90,10 +92,12 @@ getRecipes();
 async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const recipes = await getRecipes();
 
+  // Rezeptliste mit EXAKTEN URLs
   const recipeList = recipes.slice(0, 60).map(r =>
     `• "${r.title}" | URL: ${r.url} | ${r.excerpt}`
   ).join('\n');
 
+  // Produkte für Affiliate
   const productList = productsCache.length > 0
     ? '\n\nVERFÜGBARE PRODUKTE (für Empfehlungen):\n' + productsCache.map(p =>
         `• ${p.name} (Kategorie: ${p.category || 'Allgemein'}, Kontext: ${p.context || ''})`
@@ -109,8 +113,10 @@ async function buildSystemPrompt(lang, pageTitle, isRecipe) {
     es: 'Responde siempre en español.',
   };
 
+  // Kontext: User ist auf einer bestimmten Rezeptseite
   let pageContext = '';
   if (isRecipe && pageTitle) {
+    // Finde das Rezept in unserer Liste
     const currentRecipe = recipes.find(r => r.title.toLowerCase() === pageTitle.toLowerCase());
     pageContext = `
 AKTUELLER KONTEXT:
@@ -154,7 +160,9 @@ EINKAUFSLISTEN-FORMAT:
 [SHOPLIST]{"title":"Einkaufsliste für X","items":["200g Spaghetti","4 Eier","150g Speck"]}[/SHOPLIST]
 
 ${productList ? `PRODUKT-FORMAT (nur wenn es zum Rezept passt, NICHT bei jeder Antwort):
-[PRODUCT]{"name":"Produktname","emoji":"🍳","reason":"Warum es passt","url":"AFFILIATE_URL"}[/PRODUCT]` : ''}
+[PRODUCT]{"name":"Produktname","emoji":"🍳","reason":"Warum es passt","url":"BLOG_REVIEW_URL"}[/PRODUCT]
+WICHTIG: Die URL muss auf unsere Blog-Review-Seite zeigen (${SITE_URL}/...), NICHT direkt auf Amazon!
+Der User soll zuerst unseren Review lesen und kann dann von dort zu Amazon gehen.` : ''}
 
 DEINE REZEPTE (empfehle NUR aus dieser Liste, URLs EXAKT übernehmen):
 ${recipeList || 'Keine Rezepte verfügbar.'}
@@ -187,7 +195,7 @@ async function callAI(messages, lang, pageTitle, isRecipe) {
         ...messages.slice(-10),
       ],
       max_tokens: 800,
-      temperature: 0.5,
+      temperature: 0.5,  // Etwas weniger kreativ = genauer
     }),
   });
 
@@ -227,6 +235,7 @@ app.post('/api/voice', async (req, res) => {
       return res.status(400).json({ error: 'Voice not configured' });
     }
 
+    // Kürze Text auf max 500 Zeichen (Kostenkontrolle)
     const shortText = text.slice(0, 500);
 
     const ttsRes = await fetch(
@@ -255,6 +264,7 @@ app.post('/api/voice', async (req, res) => {
       return res.status(500).json({ error: 'TTS failed' });
     }
 
+    // Stream audio zurück
     res.set('Content-Type', 'audio/mpeg');
     const buffer = await ttsRes.buffer();
     res.send(buffer);
@@ -287,6 +297,7 @@ app.post('/api/whatsapp', async (req, res) => {
   res.status(200).send('OK');
 
   try {
+    // Kann direkt von Meta kommen ODER von WordPress weitergeleitet
     let entry, value, msg, from, name;
     const raw = req.body?.raw_webhook || req.body;
     const settings = {
@@ -386,8 +397,10 @@ WHATSAPP-MODUS:
 - Wenn User Deutsch schreibt → Deutsch. Englisch → Englisch. Türkisch → Türkisch. Etc.
 - Halte Antworten KURZ (max 3-4 Sätze)
 - KEINE [RECIPE], [SHOPLIST], [PRODUCT] Tags – nur einfacher Text
-- Rezept-Links als vollständige URL: ${SITE_URL}/rezept-slug/
+- Rezept-Links IMMER als vollständige URL mit Domain: ${SITE_URL}/rezept-slug/
+- WICHTIG: Jeder Rezept-Link MUSS auf unsere Website zeigen (${SITE_URL}), damit User auf unsere Seite kommen!
 - Einkaufslisten als • Aufzählung
+- Wenn du Produkte empfiehlst, verlinke auf unsere BLOG-REVIEW-SEITE (${SITE_URL}/produkt-review/), NICHT direkt auf Amazon!
 - Der User heißt: ${name || 'unbekannt'}
 - Wenn jemand "Hallo"/"Hi"/"Merhaba"/"مرحبا" sagt → Begrüße freundlich in SEINER Sprache, frage was er kochen möchte
 - Sage beim ersten Kontakt: Man kann "stop" schreiben zum Abmelden`;
@@ -434,6 +447,7 @@ app.post('/api/wa/broadcast', async (req, res) => {
     let sent = 0;
 
     if (type === 'weekly_recipes' && recipes) {
+      // Mehrsprachig: pro Subscriber in seiner Sprache
       for (const sub of subscribers) {
         const phone = sub.phone || sub;
         const lang = sub.lang || 'en';
@@ -454,8 +468,10 @@ app.post('/api/wa/broadcast', async (req, res) => {
         try {
           let msg = '';
           if (pinned_product && pinned_product.trim()) {
+            // Admin hat Produkt fixiert
             msg = buildPinnedProductMsg(pinned_product, lang);
           } else {
+            // AI generiert Empfehlung
             const allRecipes = await getRecipes();
             const latest = allRecipes.slice(0,3).map(r=>r.title).join(', ');
             const langInstructions = {
@@ -498,10 +514,6 @@ app.post('/api/wa/broadcast', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ═══════════════════════════════════════════════════════════
-// HELPER FUNCTIONS
-// ═══════════════════════════════════════════════════════════
 
 /**
  * Rezept-Broadcast mehrsprachig
@@ -559,6 +571,7 @@ async function sendWhatsApp(to, text) {
     return;
   }
 
+  // WhatsApp max 4096 Zeichen
   const msg = text.slice(0, 4000);
 
   const res = await fetch(
