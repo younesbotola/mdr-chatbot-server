@@ -404,7 +404,7 @@ setInterval(() => {
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, lang, pageTitle, isRecipe, sessionId } = req.body;
+    const { messages, lang, pageTitle, isRecipe, sessionId, voiceMode } = req.body;
     if (!messages || !Array.isArray(messages) || messages.length > 30) {
       return res.status(400).json({ error: 'messages[] required (max 30)' });
     }
@@ -439,8 +439,12 @@ app.post('/api/chat', async (req, res) => {
       webSessions.get(sessionId).msgs.push({ role: 'assistant', content: reply });
     }
 
-    // Tracking: Web-Chat Nutzung zählen
-    trackUsage(webChatStats);
+    // Tracking: Voice oder Web-Chat Nutzung zählen
+    if (voiceMode) {
+      trackUsage(voiceChatStats);
+    } else {
+      trackUsage(webChatStats);
+    }
 
     res.json({ reply });
   } catch (err) {
@@ -450,7 +454,7 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: Voice (ElevenLabs TTS)
+// ROUTE: Voice TTS (Fish Audio)
 // ═══════════════════════════════════════════════════════════
 app.post('/api/voice', async (req, res) => {
   try {
