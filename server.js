@@ -1,38 +1,126 @@
 // ═══════════════════════════════════════════════════════════
-// My Dish Recipes – Chatbot Backend v3
-// Younes Biane | SEO + Affiliate + Quality Answers
+// My Dish Recipes – Chatbot Backend v4.2
+// Autor: Younes Biane | mydishrecipes.com
+// ═══════════════════════════════════════════════════════════
+//
+// ARCHITEKTUR-ÜBERSICHT:
+// ─────────────────────────────────────────────────────────
+// Dieses Backend läuft auf Railway (Node.js) und bedient:
+//
+//   1. WEB-CHAT    POST /api/chat      → DeepSeek AI → JSON { reply }
+//   2. WHATSAPP    POST /api/whatsapp   → Meta Cloud API Webhook
+//   3. VOICE       POST /api/voice      → ElevenLabs TTS → Audio MP3
+//   4. STATS       GET  /api/stats      → Nutzungszahlen für Admin-Dashboard
+//   5. HEALTH      GET  /api/health     → Server-Status
+//   6. BROADCAST   POST /api/wa/broadcast → Wöchentliche Rezepte/Affiliate per WhatsApp
+//
+// DATENFLUSS:
+//   WordPress Plugin → REST API → Rezepte-Cache hier → DeepSeek AI Prompt
+//   User-Nachricht → Rate Limit → Input Sanitize → AI → Antwort
+//
+// REZEPT-LOGIK (3 Stufen):
+//   Stufe 1: Rezept auf unserer Seite → Link zur Seite
+//   Stufe 2: User will Details → Zutaten + Schritte im Chat + Link
+//   Stufe 3: Rezept NICHT bei uns → Allgemeines Rezept, KEINE fremden Links
+//
+// ENV-VARIABLEN (Railway Settings):
+//   DEEPSEEK_API_KEY    – DeepSeek Chat API Key
+//   SITE_URL            – WordPress Domain (z.B. https://mydishrecipes.com)
+//   WP_API_URL          – Rezepte-Endpoint (z.B. .../wp-json/mdr-chatbot/v1/recipes)
+//   META_WA_TOKEN       – Meta WhatsApp Business API Token
+//   META_WA_PHONE_ID    – WhatsApp Phone Number ID
+//   META_WA_VERIFY      – Webhook Verify Token
+//   ELEVENLABS_API_KEY  – ElevenLabs Voice API (optional)
+//   ELEVENLABS_VOICE_ID – Stimmen-ID (optional)
+//   AMAZON_PRODUCTS_URL – Produkte-API (optional)
+//
+// SICHERHEIT:
+//   - Rate Limit: 20 req/min pro IP (Web-Chat + Voice)
+//   - Body Limit: 50kb max
+//   - Input: Max 2000 Zeichen pro Nachricht, max 30 Messages
+//   - Sessions: Validierung von sessionId (Länge < 100)
 // ═══════════════════════════════════════════════════════════
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const fetch = require('node-fetch');
+// ─── ABHÄNGIGKEITEN ──────────────────────────────────────
+require('dotenv').config();           // .env Datei laden (Railway setzt ENV direkt)
+const express = require('express');   // HTTP Server Framework
+const cors = require('cors');         // Cross-Origin für WordPress→Railway Requests
+const fetch = require('node-fetch');  // HTTP Client für DeepSeek, Meta, WordPress API
 
+// ─── EXPRESS APP SETUP ───────────────────────────────────
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(cors());                                          // Erlaubt Requests von jeder Domain
+app.use(express.json({ limit: '50kb' }));                 // JSON Body Parser mit Größenlimit
+app.use(express.urlencoded({ extended: true, limit: '50kb' })); // URL-encoded Body Parser
 
-// ─── CONFIG ──────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;
-const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions';
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
-const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com';
-const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`;
-const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';
-const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
+// ─── RATE LIMITER (Schutz vor Missbrauch) ────────────────
+// Einfaches In-Memory Rate Limit: max 20 Requests pro Minute pro IP.
+// Gilt für /api/chat und /api/voice (die teuren AI-Endpoints).
+// WhatsApp hat eigenes Limit über Meta API.
+const rateLimits = new Map();         // IP → { count, ts }
+const RATE_WINDOW = 60 * 1000;       // Zeitfenster: 1 Minute
+const RATE_MAX = 20;                  // Max Requests in diesem Fenster
 
-// WhatsApp Meta Cloud API
-const META_WA_TOKEN = process.env.META_WA_TOKEN || '';
-const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || '';
-const META_WA_VERIFY = process.env.META_WA_VERIFY || 'mdr_verify_token';
+/**
+ * Rate Limit Middleware
+ * Prüft IP des Requests, zählt Requests pro Minute.
+ * Bei Überschreitung: HTTP 429 Too Many Requests.
+ */
+function rateLimit(req, res, next) {
+  // Railway/Cloudflare: Echte IP aus X-Forwarded-For Header
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+  const now = Date.now();
+  if (!rateLimits.has(ip)) rateLimits.set(ip, { count: 0, ts: now });
+  const rl = rateLimits.get(ip);
+  if (now - rl.ts > RATE_WINDOW) { rl.count = 0; rl.ts = now; } // Fenster zurücksetzen
+  rl.count++;
+  if (rl.count > RATE_MAX) return res.status(429).json({ error: 'Too many requests' });
+  next();
+}
+// Rate Limit NUR auf teure Endpoints (AI + Voice)
+app.use('/api/chat', rateLimit);
+app.use('/api/voice', rateLimit);
 
-// WhatsApp conversation memory (in-memory, resets on deploy)
-const waConversations = new Map(); // phone → [{role,content}]
-const WA_HISTORY_MAX = 10;
-const WA_HISTORY_TTL = 30 * 60 * 1000; // 30 min
+// Alte Rate-Limit-Einträge aufräumen (alle 5 Min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, rl] of rateLimits) {
+    if (now - rl.ts > RATE_WINDOW * 5) rateLimits.delete(ip);
+  }
+}, 5 * 60 * 1000);
+
+// ─── KONFIGURATION (alle aus ENV-Variablen) ──────────────
+const PORT = process.env.PORT || 3000;                        // Railway setzt PORT automatisch
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;            // DeepSeek AI API Key
+const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions'; // DeepSeek Chat Endpoint
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'; // Modell (default: deepseek-chat)
+const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com'; // WordPress-Domain
+const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`; // Rezepte REST-API
+const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';    // Produkte-API (optional, für Affiliate)
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';   // ElevenLabs Voice (optional)
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL'; // Voice-ID
+
+// WhatsApp Meta Cloud API Credentials
+const META_WA_TOKEN = process.env.META_WA_TOKEN || '';         // Permanenter System User Token
+const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || '';   // WhatsApp Business Phone Number ID
+const META_WA_VERIFY = process.env.META_WA_VERIFY || 'mdr_verify_token'; // Webhook Verify Token
+
+// ─── WHATSAPP CONVERSATION MEMORY ────────────────────────
+// In-Memory Map: Telefonnummer → { msgs[], ts, userName, userLang, dailyCount, ... }
+// Speichert die letzten 20 Nachrichten pro User für 24 Stunden.
+// ACHTUNG: Daten gehen bei Railway Deploy/Restart verloren!
+// Für persistente Daten → Redis oder Datenbank nötig (zukünftig).
+const waConversations = new Map(); // phone → {msgs, ts, name, lang, ...}
+const WA_HISTORY_MAX = 20;                    // Max Nachrichten pro Conversation
+const WA_HISTORY_TTL = 24 * 60 * 60 * 1000;  // 24 Stunden Time-to-Live
+
+// Abgelaufene Conversations automatisch entfernen (alle 30 Min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [phone, conv] of waConversations) {
+    if (now - conv.ts > WA_HISTORY_TTL) waConversations.delete(phone);
+  }
+}, 30 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════════
 // LIVE REZEPT-CACHE
@@ -88,21 +176,78 @@ async function getRecipes() {
 // Beim Start einmal laden
 getRecipes();
 
+// ─── BRANDING CACHE (Bot-Name, Emoji, Blog-Name) ────────
+let brandingCache = { bot_name: 'Lily', bot_emoji: '👩‍🍳', blog_name: 'My Dish Recipes' };
+const BRANDING_API = process.env.BRANDING_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/branding`;
+
+async function getBranding() {
+  try {
+    const res = await fetch(BRANDING_API, { timeout: 5000 });
+    if (res.ok) {
+      const data = await res.json();
+      brandingCache = { ...brandingCache, ...data };
+      console.log(`[Branding] ${brandingCache.bot_name} ${brandingCache.bot_emoji} @ ${brandingCache.blog_name}`);
+    }
+  } catch (e) {
+    console.error('[Branding] Fehler:', e.message);
+  }
+}
+getBranding();
+// Branding alle 30 Min refreshen
+setInterval(getBranding, 30 * 60 * 1000);
+
 // ─── SYSTEM PROMPT ──────────────────────────────────────
 async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const recipes = await getRecipes();
+  const { bot_name: botName, bot_emoji: botEmoji, blog_name: blogName } = brandingCache;
 
-  // Rezeptliste mit EXAKTEN URLs
-  const recipeList = recipes.slice(0, 60).map(r =>
+  // ── Rezeptliste für den Prompt zusammenstellen ──
+  // Wenn Admin Rezepte fixiert hat → nur diese zeigen
+  // Sonst: Mix aus neuesten + zufälligen Rezepten (damit Bot variiert)
+  const pinnedRecipeIds = (brandingCache.pinned_recipe_ids || '').split(',').map(s=>s.trim()).filter(Boolean);
+  let promptRecipes = recipes;
+
+  if (pinnedRecipeIds.length > 0) {
+    // Admin hat bestimmte Rezepte vorgegeben → die zuerst, Rest dahinter
+    const pinned = recipes.filter(r => pinnedRecipeIds.includes(String(r.id)));
+    const rest = recipes.filter(r => !pinnedRecipeIds.includes(String(r.id)));
+    promptRecipes = [...pinned, ...rest];
+  } else {
+    // Keine Vorgabe → Mix: 30 neueste + 30 zufällige (verhindert "immer das Gleiche")
+    const newest = recipes.slice(0, 30);
+    const older = recipes.slice(30);
+    // Fisher-Yates Shuffle auf ältere Rezepte
+    for (let i = older.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [older[i], older[j]] = [older[j], older[i]];
+    }
+    promptRecipes = [...newest, ...older.slice(0, 30)];
+  }
+
+  const recipeList = promptRecipes.slice(0, 60).map(r =>
     `• "${r.title}" | URL: ${r.url} | ${r.excerpt}`
   ).join('\n');
 
-  // Produkte für Affiliate
-  const productList = productsCache.length > 0
-    ? '\n\nVERFÜGBARE PRODUKTE (für Empfehlungen):\n' + productsCache.map(p =>
+  // ── Produktliste separat (unabhängig vom Affiliate-Modul) ──
+  // Stufe 1: Fixierte Produkte aus Admin-Panel (Blog-Review-URLs)
+  // Stufe 2: Produkte aus PRODUCTS_API (Affiliate)
+  // Stufe 3: Keine Produkte → kein PRODUKT-Block im Prompt
+  const pinnedProducts = (brandingCache.pinned_products || '').trim();
+  let productList = '';
+
+  if (pinnedProducts) {
+    // Admin hat Produkte fixiert → diese nutzen
+    const items = pinnedProducts.split('\n').filter(Boolean).map(line => {
+      const [name, url] = line.split('|').map(s => s.trim());
+      return `• ${name}${url ? ` → ${SITE_URL}${url.startsWith('/') ? url : '/' + url}` : ''}`;
+    });
+    productList = '\n\nFIXIERTE PRODUKT-EMPFEHLUNGEN (Blog-Reviews):\n' + items.join('\n');
+  } else if (productsCache.length > 0) {
+    // Keine fixierten → Produkte aus API (wenn konfiguriert)
+    productList = '\n\nVERFÜGBARE PRODUKTE (für Empfehlungen):\n' + productsCache.map(p =>
         `• ${p.name} (Kategorie: ${p.category || 'Allgemein'}, Kontext: ${p.context || ''})`
-      ).join('\n')
-    : '';
+      ).join('\n');
+  }
 
   const langMap = {
     de: 'Antworte immer auf Deutsch.',
@@ -133,7 +278,13 @@ VERHALTEN AUF REZEPTSEITEN:
 `;
   }
 
-  return `Du bist "Lily" 👩‍🍳, die freundliche Rezept-Assistentin von "My Dish Recipes" (${SITE_URL}).
+  // ── Rezept-Verhalten klar definieren ──
+  // Stufe 1: Rezept auf unserer Seite → Link + Details
+  // Stufe 2: User will Details im Chat → Zutaten & Schritte aus unserem Rezept liefern
+  // Stufe 3: Rezept NICHT bei uns → allgemeines Rezept-Wissen, KEINE fremden Links
+
+  return `Du bist "${botName}" ${botEmoji}, die persönliche Kochassistentin von "${blogName}" (${SITE_URL}).
+Du bist NICHT nur ein Chatbot – du bist der persönliche Kochassistent des Users! Behandle jeden User so, als wärst du sein/ihr privater Koch-Buddy.
 
 SPRACHE:
 - Die Startsprache des Users ist: ${langMap[lang] || langMap.en}
@@ -142,18 +293,47 @@ SPRACHE:
 - Passe dich immer der letzten Nachricht des Users an.
 
 DEINE PERSÖNLICHKEIT:
-- Du bist Lily, eine leidenschaftliche Köchin und Food-Liebhaberin
-- Warmherzig, enthusiastisch, hilfsbereit
-- Du liebst es, Leuten das perfekte Rezept zu empfehlen
+- Du bist ${botName}, eine leidenschaftliche Köchin und persönliche Food-Beraterin
+- Warmherzig, enthusiastisch, hilfsbereit – wie eine gute Freundin die gerne kocht
+- Du merkst dir was der User mag, was er nicht mag, welche Geräte er hat
+- Du sprichst den User persönlich an und gibst individuelle Empfehlungen
 - Halte Antworten KURZ (2-3 Sätze + Rezeptkarten)
 - Frag nach: Was möchtest du kochen? Welche Zutaten hast du?
+- Wenn der User dir etwas über sich erzählt (Vegetarier, Allergien, Lieblingsküche) → merke es dir und berücksichtige es!
 
-WICHTIGSTE REGEL – REZEPTE:
-Du darfst NUR Rezepte empfehlen die in der folgenden Liste stehen!
-Erfinde NIEMALS Rezepte oder URLs. Wenn nichts passt, sage ehrlich:
-"Dazu habe ich leider kein passendes Rezept, aber schau gerne auf unserer Seite!"
+════════════════════════════════════════
+REZEPT-LOGIK (WICHTIGSTE REGELN!)
+════════════════════════════════════════
 
-REZEPT-FORMAT (NUR für echte Rezepte aus der Liste):
+STUFE 1 – REZEPT AUF UNSERER SEITE VORHANDEN:
+→ Zeige die Rezeptkarte mit Link zu unserer Seite.
+→ Verwende das [RECIPE]-Format (Web) oder den vollständigen Link (WhatsApp).
+→ Empfehle dem User, das volle Rezept auf unserer Seite anzuschauen.
+
+STUFE 2 – USER WILL DETAILS IM CHAT (Zutaten, Schritte, Tipps):
+→ Wenn das Rezept auf unserer Seite existiert: Gib die Zutaten und Zubereitungsschritte
+  im Chat, basierend auf dem was du über das Rezept weißt. Sage dazu:
+  "Das vollständige Rezept mit Bildern findest du hier: [Link]"
+→ Erfinde KEINE Zutaten oder Schritte, die nicht zum Rezept gehören!
+
+STUFE 3 – REZEPT NICHT AUF UNSERER SEITE:
+→ Du darfst trotzdem helfen! Gib ein allgemeines Rezept mit:
+  - Zutatenliste
+  - Schritt-für-Schritt Anleitung
+  - Tipps und Variationen
+→ WICHTIG: ERFINDE KEINE URLs! Gib KEINEN Link zu fremden Websites!
+→ NIEMALS externe Domains zitieren oder verlinken (kein chefkoch.de, kein allrecipes.com, etc.)
+→ Sage: "Dieses Rezept haben wir noch nicht auf unserer Seite – aber hier ist mein Vorschlag:"
+→ Gib dann ein sauberes, vollständiges Rezept im Chat.
+→ Wenn möglich, empfehle ein ähnliches Rezept von unserer Seite dazu.
+
+ABSOLUT VERBOTEN:
+❌ Fremde Website-URLs oder Domains nennen (kein chefkoch, allrecipes, etc.)
+❌ URLs erfinden die nicht in der Rezeptliste stehen
+❌ Sagen "das kann ich nicht" wenn der User ein Rezept will das wir nicht haben
+✅ Stattdessen: Allgemeines Koch-Wissen nutzen und Rezept im Chat liefern
+
+REZEPT-FORMAT (NUR für Rezepte aus UNSERER Liste):
 [RECIPE]{"title":"EXAKTER Titel aus Liste","emoji":"🍝","desc":"Kurzbeschreibung","time":"30 Min","difficulty":"Einfach","url":"EXAKTE URL aus Liste"}[/RECIPE]
 
 EINKAUFSLISTEN-FORMAT:
@@ -164,17 +344,17 @@ ${productList ? `PRODUKT-FORMAT (nur wenn es zum Rezept passt, NICHT bei jeder A
 WICHTIG: Die URL muss auf unsere Blog-Review-Seite zeigen (${SITE_URL}/...), NICHT direkt auf Amazon!
 Der User soll zuerst unseren Review lesen und kann dann von dort zu Amazon gehen.` : ''}
 
-DEINE REZEPTE (empfehle NUR aus dieser Liste, URLs EXAKT übernehmen):
+UNSERE REZEPTE (Links nur aus dieser Liste, URLs EXAKT übernehmen):
 ${recipeList || 'Keine Rezepte verfügbar.'}
 
 VERHALTEN:
 - Maximal 3 Rezepte pro Antwort
-- URLs MÜSSEN exakt aus der Liste übernommen werden
+- URLs MÜSSEN exakt aus der Liste übernommen werden – NIEMALS erfinden!
 - Bei "Einkaufsliste" → erstelle mit [SHOPLIST]
 - Bleib beim Thema Kochen & Rezepte
 - Sei freundlich, nicht roboterhaft
 - Wenn User Zutaten nennt → finde das beste passende Rezept aus der Liste
-- Wenn kein Rezept passt → empfehle die nächstbeste Option aus der Liste
+- Wenn kein Rezept passt → liefere ein allgemeines Rezept (ohne fremde Links!)
 ${pageContext}`;
 }
 
@@ -209,15 +389,59 @@ async function callAI(messages, lang, pageTitle, isRecipe) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: Web Chat
+// ROUTE: Web Chat (mit Session-Tracking)
 // ═══════════════════════════════════════════════════════════
+const webSessions = new Map(); // sessionId → { msgs, ts }
+const WEB_SESSION_TTL = 60 * 60 * 1000; // 1 Stunde
+
+// Web sessions aufräumen (alle 15 Min)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, s] of webSessions) {
+    if (now - s.ts > WEB_SESSION_TTL) webSessions.delete(id);
+  }
+}, 15 * 60 * 1000);
+
 app.post('/api/chat', async (req, res) => {
   try {
-    const { messages, lang, pageTitle, isRecipe } = req.body;
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'messages[] required' });
+    const { messages, lang, pageTitle, isRecipe, sessionId } = req.body;
+    if (!messages || !Array.isArray(messages) || messages.length > 30) {
+      return res.status(400).json({ error: 'messages[] required (max 30)' });
     }
-    const reply = await callAI(messages, lang, pageTitle, isRecipe);
+    // Sanitize: limit message content length
+    const cleanMessages = messages.map(m => ({
+      role: m.role === 'assistant' ? 'assistant' : 'user',
+      content: typeof m.content === 'string' ? m.content.slice(0, 2000) : '',
+    })).filter(m => m.content.length > 0);
+
+    // Session-Tracking: merge mit vorherigen Nachrichten
+    let fullMessages = cleanMessages;
+    if (sessionId && typeof sessionId === 'string' && sessionId.length < 100) {
+      if (!webSessions.has(sessionId)) {
+        webSessions.set(sessionId, { msgs: [], ts: Date.now() });
+      }
+      const session = webSessions.get(sessionId);
+      session.ts = Date.now();
+
+      // Neue Nachrichten hinzufügen
+      const lastStored = session.msgs.length;
+      if (cleanMessages.length > lastStored) {
+        session.msgs = cleanMessages.slice();
+      }
+      if (session.msgs.length > 20) session.msgs = session.msgs.slice(-20);
+      fullMessages = session.msgs;
+    }
+
+    const reply = await callAI(fullMessages, lang, pageTitle, isRecipe);
+
+    // Antwort in Session speichern
+    if (sessionId && webSessions.has(sessionId)) {
+      webSessions.get(sessionId).msgs.push({ role: 'assistant', content: reply });
+    }
+
+    // Tracking: Web-Chat Nutzung zählen
+    trackUsage(webChatStats);
+
     res.json({ reply });
   } catch (err) {
     console.error('[Chat]', err.message);
@@ -267,6 +491,7 @@ app.post('/api/voice', async (req, res) => {
     // Stream audio zurück
     res.set('Content-Type', 'audio/mpeg');
     const buffer = await ttsRes.buffer();
+    trackUsage(voiceChatStats);
     res.send(buffer);
 
   } catch (err) {
@@ -316,7 +541,7 @@ app.post('/api/whatsapp', async (req, res) => {
 
     let userText = '';
     if (type === 'text') {
-      userText = msg.text?.body || '';
+      userText = (msg.text?.body || '').slice(0, 2000); // Limit input
     } else if (type === 'audio') {
       userText = '[Der User hat eine Sprachnachricht gesendet. Antworte freundlich, frage was du helfen kannst. Erwähne dass du leider noch keine Sprachnachrichten verstehen kannst, aber gerne Textfragen beantwortest.]';
     } else if (type === 'interactive') {
@@ -374,21 +599,26 @@ app.post('/api/whatsapp', async (req, res) => {
       });
     } catch(e) {}
 
-    // Conversation History
+    // Conversation History – Name und Sprache merken
     if (!waConversations.has(from)) {
-      waConversations.set(from, { msgs:[], ts:Date.now(), dailyCount:1, dailyDate:new Date().toDateString() });
+      waConversations.set(from, { msgs:[], ts:Date.now(), dailyCount:1, dailyDate:new Date().toDateString(), userName:name||'', userLang:'' });
     }
     const conv = waConversations.get(from);
     conv.ts = Date.now();
+    if (name && !conv.userName) conv.userName = name; // Name merken
     conv.msgs.push({ role:'user', content:userText });
     if (conv.msgs.length > WA_HISTORY_MAX) conv.msgs = conv.msgs.slice(-WA_HISTORY_MAX);
+    const isFirstContact = conv.msgs.filter(m => m.role === 'user').length === 1;
 
-    // Sprache: erst aus Text erkennen, Fallback Vorwahl
+    // Sprache: erst aus Text erkennen, Fallback gespeichert, dann Vorwahl
     const textLang = detectLang(userText);
-    const lang = textLang || phoneLang;
+    const lang = textLang || conv.userLang || phoneLang;
+    if (textLang) conv.userLang = textLang; // Sprache merken
 
     // AI Antwort
     const systemPrompt = await buildSystemPrompt(lang, '', false);
+    const userName = conv.userName || name || '';
+    const msgCount = conv.msgs.filter(m => m.role === 'user').length;
     const waSystemPrompt = systemPrompt + `
 
 WHATSAPP-MODUS:
@@ -401,9 +631,22 @@ WHATSAPP-MODUS:
 - WICHTIG: Jeder Rezept-Link MUSS auf unsere Website zeigen (${SITE_URL}), damit User auf unsere Seite kommen!
 - Einkaufslisten als • Aufzählung
 - Wenn du Produkte empfiehlst, verlinke auf unsere BLOG-REVIEW-SEITE (${SITE_URL}/produkt-review/), NICHT direkt auf Amazon!
-- Der User heißt: ${name || 'unbekannt'}
-- Wenn jemand "Hallo"/"Hi"/"Merhaba"/"مرحبا" sagt → Begrüße freundlich in SEINER Sprache, frage was er kochen möchte
-- Sage beim ersten Kontakt: Man kann "stop" schreiben zum Abmelden`;
+
+REZEPT-VERHALTEN IM WHATSAPP:
+- Stufe 1: Wenn Rezept auf unserer Seite → Link geben: ${SITE_URL}/rezept-name/
+- Stufe 2: Wenn User "zeig mir das Rezept" oder Details will → Zutaten + Schritte im Chat, PLUS Link
+- Stufe 3: Wenn Rezept NICHT auf unserer Seite → Zutaten + Schritte im Chat, OHNE fremde Links
+  Sage: "Das haben wir noch nicht auf unserer Seite, aber hier ist mein Rezept für dich:"
+  Dann Zutaten + Schritte liefern. NIEMALS fremde Websites verlinken!
+
+PERSÖNLICHKEIT & KONTEXT:
+- Der User heißt: ${userName || 'unbekannt'}${userName ? ` – nutze den Namen gelegentlich persönlich (z.B. "Hey ${userName}!", "Gute Wahl, ${userName}!")` : ''}
+- Das ist Nachricht Nr. ${msgCount} von diesem User
+${isFirstContact ? '- ERSTER KONTAKT: Begrüße herzlich, stelle dich kurz vor, frage was er/sie kochen möchte. Sage: Man kann "stop" schreiben zum Abmelden.' : '- WIEDERKEHRENDER USER: Ihr kennt euch schon. Sei freundlich aber überspringe die Vorstellung. Beziehe dich auf den bisherigen Gesprächsverlauf.'}
+- WICHTIG: Lies den bisherigen Chat-Verlauf genau! Wenn der User vorher etwas erwähnt hat (Zutaten, Vorlieben, Allergien, Geräte), erinnere dich daran und nutze es.
+- Wenn der User z.B. gesagt hat "ich habe Hähnchen" und jetzt fragt "was noch?" → beziehe dich auf das Hähnchen!
+- Merke dir Vorlieben: Wenn jemand sagt "ich bin Vegetarier" oder "kein Schwein" → respektiere das in ALLEN folgenden Antworten
+- Sei warm, persönlich und wie ein Freund der gerne kocht – nicht wie ein Roboter`;
 
     const aiRes = await fetch(DEEPSEEK_URL, {
       method:'POST',
@@ -412,9 +655,9 @@ WHATSAPP-MODUS:
         model: DEEPSEEK_MODEL,
         messages: [
           {role:'system', content:waSystemPrompt},
-          ...conv.msgs.slice(-8),
+          ...conv.msgs.slice(-12),
         ],
-        max_tokens: 500, temperature: 0.5,
+        max_tokens: 600, temperature: 0.6,
       }),
     });
 
@@ -430,6 +673,7 @@ WHATSAPP-MODUS:
 
     conv.msgs.push({role:'assistant',content:reply});
     await sendWhatsApp(from, reply);
+    trackUsage(waChatStats);
 
   } catch (err) {
     console.error('[WA] Error:', err.message);
@@ -635,13 +879,60 @@ function detectLang(text) {
   return 'en';
 }
 
-// Cleanup alte WhatsApp Conversations (alle 10 Min)
-setInterval(() => {
-  const now = Date.now();
-  for (const [phone, conv] of waConversations) {
-    if (now - conv.ts > WA_HISTORY_TTL) waConversations.delete(phone);
+
+// ═══════════════════════════════════════════════════════════
+// TRACKING STATS – Web, WhatsApp, Voice
+// ═══════════════════════════════════════════════════════════
+const webChatStats = { today: 0, daily: {}, lastActive: 0 };
+const waChatStats = { today: 0, daily: {}, lastActive: 0 };
+const voiceChatStats = { today: 0, daily: {}, lastActive: 0 };
+
+function trackUsage(statsObj) {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  if (!statsObj.daily[today]) statsObj.daily[today] = 0;
+  statsObj.daily[today]++;
+  statsObj.today = statsObj.daily[today];
+  statsObj.lastActive = Date.now();
+  // Nur letzte 60 Tage behalten
+  const keys = Object.keys(statsObj.daily).sort();
+  if (keys.length > 60) {
+    keys.slice(0, keys.length - 60).forEach(k => delete statsObj.daily[k]);
   }
-}, 10 * 60 * 1000);
+}
+
+function getStatsRange(statsObj, days) {
+  const now = new Date();
+  let total = 0;
+  for (let i = 0; i < days; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    total += statsObj.daily[key] || 0;
+  }
+  return total;
+}
+
+// Stats API für Admin-Dashboard
+app.get('/api/stats', (req, res) => {
+  res.json({
+    web: {
+      today: getStatsRange(webChatStats, 1),
+      week: getStatsRange(webChatStats, 7),
+      month: getStatsRange(webChatStats, 30),
+    },
+    whatsapp: {
+      today: getStatsRange(waChatStats, 1),
+      week: getStatsRange(waChatStats, 7),
+      month: getStatsRange(waChatStats, 30),
+      subscribers: waConversations.size,
+    },
+    voice: {
+      today: getStatsRange(voiceChatStats, 1),
+      week: getStatsRange(voiceChatStats, 7),
+      month: getStatsRange(voiceChatStats, 30),
+    },
+  });
+});
 
 // ═══════════════════════════════════════════════════════════
 // ROUTE: Health
@@ -671,7 +962,7 @@ app.get('/api/recipes', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`
   ┌──────────────────────────────────────┐
-  │  🍽️  My Dish Recipes Chatbot v4      │
+  │  🍽️  My Dish Recipes Chatbot v4.2    │
   │  Port: ${PORT}                             │
   │  API:  ${WP_API.slice(0, 32)}...  │
   │  WA:   ${META_WA_TOKEN ? '✅ Connected' : '❌ Not configured'}              │
