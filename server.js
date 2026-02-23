@@ -30,8 +30,8 @@
 //   META_WA_TOKEN       – Meta WhatsApp Business API Token
 //   META_WA_PHONE_ID    – WhatsApp Phone Number ID
 //   META_WA_VERIFY      – Webhook Verify Token
-//   ELEVENLABS_API_KEY  – ElevenLabs Voice API (optional)
-//   ELEVENLABS_VOICE_ID – Stimmen-ID (optional)
+//   FISH_AUDIO_API_KEY  – Fish Audio TTS API Key (optional)
+//   FISH_AUDIO_VOICE_ID – Fish Audio Stimmen-ID (optional)
 //   AMAZON_PRODUCTS_URL – Produkte-API (optional)
 //
 // SICHERHEIT:
@@ -97,8 +97,8 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'; // Modell 
 const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com'; // WordPress-Domain
 const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`; // Rezepte REST-API
 const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';    // Produkte-API (optional, für Affiliate)
-const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';   // ElevenLabs Voice (optional)
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL'; // Voice-ID
+const FISH_AUDIO_KEY = process.env.FISH_AUDIO_API_KEY || '';   // Fish Audio TTS API Key
+const FISH_AUDIO_VOICE = process.env.FISH_AUDIO_VOICE_ID || ''; // Fish Audio Voice/Reference-ID
 
 // WhatsApp Meta Cloud API Credentials
 const META_WA_TOKEN = process.env.META_WA_TOKEN || '';         // Permanenter System User Token
@@ -455,47 +455,58 @@ app.post('/api/chat', async (req, res) => {
 app.post('/api/voice', async (req, res) => {
   try {
     const { text, lang } = req.body;
-    if (!text || !ELEVENLABS_KEY) {
+    if (!text || !FISH_AUDIO_KEY) {
+      console.error('[Voice] Not configured. Key:', !!FISH_AUDIO_KEY, 'Voice:', FISH_AUDIO_VOICE);
       return res.status(400).json({ error: 'Voice not configured' });
     }
 
     // Kürze Text auf max 500 Zeichen (Kostenkontrolle)
     const shortText = text.slice(0, 500);
 
+    // ── Fish Audio TTS API ──
+    // Docs: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech
+    const ttsBody = {
+      text: shortText,
+      format: 'mp3',
+      mp3_bitrate: 128,
+      normalize: true,
+      latency: 'balanced',
+    };
+
+    // Voice-ID: Wenn gesetzt, nutze die gewählte Stimme (Sarah)
+    if (FISH_AUDIO_VOICE) {
+      ttsBody.reference_id = FISH_AUDIO_VOICE;
+    }
+
+    console.log('[Voice] Calling Fish Audio...', { textLen: shortText.length, voice: FISH_AUDIO_VOICE || 'default' });
+
     const ttsRes = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+      'https://api.fish.audio/v1/tts',
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'xi-api-key': ELEVENLABS_KEY,
+          'Authorization': `Bearer ${FISH_AUDIO_KEY}`,
         },
-        body: JSON.stringify({
-          text: shortText,
-          model_id: 'eleven_multilingual_v2',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-            style: 0.3,
-          },
-        }),
+        body: JSON.stringify(ttsBody),
       }
     );
 
     if (!ttsRes.ok) {
       const err = await ttsRes.text();
-      console.error('[Voice] ElevenLabs error:', err);
-      return res.status(500).json({ error: 'TTS failed' });
+      console.error('[Voice] Fish Audio error:', ttsRes.status, err);
+      return res.status(500).json({ error: 'TTS failed', detail: err });
     }
 
-    // Stream audio zurück
+    // Audio zurück an Client
     res.set('Content-Type', 'audio/mpeg');
     const buffer = await ttsRes.buffer();
+    console.log('[Voice] Success, audio size:', buffer.length, 'bytes');
     trackUsage(voiceChatStats);
     res.send(buffer);
 
   } catch (err) {
-    console.error('[Voice]', err.message);
+    console.error('[Voice] Exception:', err.message);
     res.status(500).json({ error: 'Voice error' });
   }
 });
@@ -683,23 +694,39 @@ ${isFirstContact ? '- ERSTER KONTAKT: Begrüße herzlich, stelle dich kurz vor, 
 // WhatsApp Broadcast Endpoint (von WordPress Cron aufgerufen)
 app.post('/api/wa/broadcast', async (req, res) => {
   try {
-    const { type, recipes, subscribers, pinned_product } = req.body;
+    const { type, recipes, subscribers, pinned_product, botName } = req.body;
     if (!subscribers || !Array.isArray(subscribers)) {
       return res.status(400).json({ error: 'subscribers[] required' });
     }
 
+    // ── Schutz gegen doppelte Broadcasts (30 Min Lock) ──
+    const lockKey = `_broadcast_lock_${type}`;
+    if (global[lockKey] && Date.now() - global[lockKey] < 30 * 60 * 1000) {
+      console.log(`[WA Broadcast] ${type} BLOCKED – duplicate lock active`);
+      return res.json({ sent: 0, total: subscribers.length, blocked: 'duplicate' });
+    }
+    global[lockKey] = Date.now();
+
     let sent = 0;
 
     if (type === 'weekly_recipes' && recipes) {
-      // Mehrsprachig: pro Subscriber in seiner Sprache
       for (const sub of subscribers) {
         const phone = sub.phone || sub;
         const lang = sub.lang || 'en';
+        const name = sub.name || '';
         try {
-          let msg = buildRecipeBroadcast(recipes, lang);
+          // Timezone-Check: nicht vor 8:00 oder nach 21:00 Ortszeit senden
+          const tz = getTimezoneFromPhone(phone);
+          const localHour = getLocalHour(tz);
+          if (localHour < 8 || localHour > 21) {
+            console.log(`[WA Broadcast] Skip ${phone} – ${localHour}h in ${tz}`);
+            continue;
+          }
+          // EINE Nachricht: Begrüßung + Rezepte mit Links + Footer
+          const msg = buildRecipeBroadcast(recipes, lang, botName || 'Lily', name);
           await sendWhatsApp(phone, msg);
           sent++;
-          await new Promise(r => setTimeout(r, 100));
+          await new Promise(r => setTimeout(r, 200));
         } catch(e) {
           console.error(`[WA Broadcast] Failed ${phone}:`, e.message);
         }
@@ -712,10 +739,8 @@ app.post('/api/wa/broadcast', async (req, res) => {
         try {
           let msg = '';
           if (pinned_product && pinned_product.trim()) {
-            // Admin hat Produkt fixiert
             msg = buildPinnedProductMsg(pinned_product, lang);
           } else {
-            // AI generiert Empfehlung
             const allRecipes = await getRecipes();
             const latest = allRecipes.slice(0,3).map(r=>r.title).join(', ');
             const langInstructions = {
@@ -743,7 +768,7 @@ app.post('/api/wa/broadcast', async (req, res) => {
             await sendWhatsApp(phone, msg);
             sent++;
           }
-          await new Promise(r => setTimeout(r, 100));
+          await new Promise(r => setTimeout(r, 200));
         } catch(e) {
           console.error(`[WA Affiliate] Failed ${phone}:`, e.message);
         }
@@ -760,27 +785,69 @@ app.post('/api/wa/broadcast', async (req, res) => {
 });
 
 /**
- * Rezept-Broadcast mehrsprachig
+ * Timezone aus Telefon-Vorwahl → sendet Broadcasts zur Ortszeit
  */
-function buildRecipeBroadcast(recipes, lang) {
-  const headers = {
-    de:'🍽️ *Rezepte der Woche!*', en:'🍽️ *Recipes of the Week!*',
-    tr:'🍽️ *Haftanın Tarifleri!*', ar:'🍽️ *وصفات الأسبوع!*',
-    fr:'🍽️ *Recettes de la Semaine !*', es:'🍽️ *Recetas de la Semana!*',
+function getTimezoneFromPhone(phone) {
+  const clean = phone.replace(/[^0-9]/g, '');
+  const map = {
+    '1':'America/New_York','44':'Europe/London','49':'Europe/Berlin',
+    '43':'Europe/Vienna','41':'Europe/Zurich','90':'Europe/Istanbul',
+    '33':'Europe/Paris','34':'Europe/Madrid','39':'Europe/Rome',
+    '31':'Europe/Amsterdam','966':'Asia/Riyadh','971':'Asia/Dubai',
+    '20':'Africa/Cairo','212':'Africa/Casablanca','55':'America/Sao_Paulo',
+    '52':'America/Mexico_City','91':'Asia/Kolkata','86':'Asia/Shanghai','81':'Asia/Tokyo',
   };
+  for (const len of [3, 2, 1]) {
+    const pre = clean.substring(0, len);
+    if (map[pre]) return map[pre];
+  }
+  return 'Europe/Berlin';
+}
+
+function getLocalHour(tz) {
+  try {
+    const str = new Date().toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false });
+    return parseInt(str, 10);
+  } catch(e) { return 12; }
+}
+
+/**
+ * Rezept-Broadcast: EINE Nachricht mit persönlicher Begrüßung + Rezepte mit Links + Footer
+ * Sprache basiert auf Telefon-Vorwahl des Subscribers
+ */
+function buildRecipeBroadcast(recipes, lang, botName, subscriberName) {
+  const bot = botName || 'Lily';
+  const firstName = subscriberName ? subscriberName.split(' ')[0] : '';
+
+  // Persönliche Begrüßung mit Subscriber-Name wenn vorhanden
+  const intros = {
+    de: `Hey${firstName ? ' ' + firstName : ''}! 😊 Hier ist ${bot} mit frischen Rezept-Ideen für dich:`,
+    en: `Hey${firstName ? ' ' + firstName : ''}! 😊 It's ${bot} with fresh recipe ideas for you:`,
+    tr: `Merhaba${firstName ? ' ' + firstName : ''}! 😊 ${bot} sizin için taze tarif fikirleriyle burada:`,
+    ar: `${firstName ? firstName + ' ' : ''}مرحبا! 😊 أنا ${bot} مع أفكار وصفات طازجة لك:`,
+    fr: `Salut${firstName ? ' ' + firstName : ''} ! 😊 C'est ${bot} avec de nouvelles idées de recettes :`,
+    es: `¡Hola${firstName ? ' ' + firstName : ''}! 😊 Soy ${bot} con ideas frescas de recetas:`,
+  };
+
   const footers = {
-    de:'_Antworte mit einer Nummer für mehr Infos! "stop" zum Abmelden_',
-    en:'_Reply with a number for more info! "stop" to unsubscribe_',
-    tr:'_Daha fazla bilgi için bir numara ile yanıtlayın! "stop" abonelikten çıkmak için_',
-    ar:'_رد برقم للمزيد من المعلومات! "stop" لإلغاء الاشتراك_',
-    fr:'_Répondez avec un numéro pour plus d\'infos ! "stop" pour se désabonner_',
-    es:'_Responde con un número para más info! "stop" para cancelar_',
+    de: `\n💬 _Antworte einfach mit einer Nummer für Details!_\n\n_"stop" zum Abmelden_`,
+    en: `\n💬 _Reply with a number for details!_\n\n_"stop" to unsubscribe_`,
+    tr: `\n💬 _Detaylar için bir numara ile yanıtlayın!_\n\n_"stop" abonelikten çıkmak için_`,
+    ar: `\n💬 _رد برقم للتفاصيل!_\n\n_"stop" لإلغاء الاشتراك_`,
+    fr: `\n💬 _Répondez avec un numéro pour les détails !_\n\n_"stop" pour se désabonner_`,
+    es: `\n💬 _Responde con un número para detalles!_\n\n_"stop" para cancelar_`,
   };
-  let msg = (headers[lang]||headers.en) + '\n\n';
-  recipes.forEach((r,i) => {
-    msg += `${i+1}. *${r.title}*\n${r.excerpt}\n👉 ${r.url}\n\n`;
+
+  let msg = (intros[lang] || intros.en) + '\n\n';
+
+  recipes.forEach((r, i) => {
+    msg += `*${i + 1}. ${r.title}*\n`;
+    if (r.excerpt) msg += `${r.excerpt}\n`;
+    if (r.url) msg += `👉 ${r.url}\n`;
+    msg += '\n';
   });
-  msg += footers[lang]||footers.en;
+
+  msg += (footers[lang] || footers.en);
   return msg;
 }
 
