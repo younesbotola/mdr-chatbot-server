@@ -30,8 +30,10 @@
 //   META_WA_TOKEN       – Meta WhatsApp Business API Token
 //   META_WA_PHONE_ID    – WhatsApp Phone Number ID
 //   META_WA_VERIFY      – Webhook Verify Token
-//   FISH_AUDIO_API_KEY  – Fish Audio TTS API Key (optional)
-//   FISH_AUDIO_VOICE_ID – Fish Audio Stimmen-ID (optional)
+//   FISH_AUDIO_API_KEY  – (VERALTET, ersetzt durch ElevenLabs)
+//   FISH_AUDIO_VOICE_ID – (VERALTET, ersetzt durch ElevenLabs)
+//   ELEVENLABS_API_KEY  – ElevenLabs TTS API Key
+//   ELEVENLABS_VOICE_ID – ElevenLabs Voice ID
 //   AMAZON_PRODUCTS_URL – Produkte-API (optional)
 //
 // SICHERHEIT:
@@ -97,8 +99,8 @@ const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'; // Modell 
 const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com'; // WordPress-Domain
 const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`; // Rezepte REST-API
 const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';    // Produkte-API (optional, für Affiliate)
-const FISH_AUDIO_KEY = process.env.FISH_AUDIO_API_KEY || '';   // Fish Audio TTS API Key
-const FISH_AUDIO_VOICE = process.env.FISH_AUDIO_VOICE_ID || ''; // Fish Audio Voice/Reference-ID
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';    // ElevenLabs TTS API Key
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || ''; // ElevenLabs Voice ID
 
 // WhatsApp Meta Cloud API Credentials
 const META_WA_TOKEN = process.env.META_WA_TOKEN || '';         // Permanenter System User Token
@@ -470,51 +472,49 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: Voice TTS (Fish Audio)
+// ROUTE: Voice TTS (ElevenLabs Multilingual v2)
+// Auto-erkennt die Sprache aus dem Text → perfekt für 6+ Sprachen
 // ═══════════════════════════════════════════════════════════
 app.post('/api/voice', async (req, res) => {
   try {
     const { text, lang } = req.body;
-    if (!text || !FISH_AUDIO_KEY) {
-      console.error('[Voice] Not configured. Key:', !!FISH_AUDIO_KEY, 'Voice:', FISH_AUDIO_VOICE);
+    if (!text || !ELEVENLABS_KEY) {
+      console.error('[Voice] Not configured. Key:', !!ELEVENLABS_KEY, 'Voice:', ELEVENLABS_VOICE);
       return res.status(400).json({ error: 'Voice not configured' });
     }
 
     // Kürze Text auf max 500 Zeichen (Kostenkontrolle)
     const shortText = text.slice(0, 500);
+    const voiceId = ELEVENLABS_VOICE || 'EXAVITQu4vr4xnSDxMaL'; // Default: Sarah
 
-    // ── Fish Audio TTS API ──
-    // Docs: https://docs.fish.audio/api-reference/endpoint/openapi-v1/text-to-speech
-    const ttsBody = {
-      text: shortText,
-      format: 'mp3',
-      mp3_bitrate: 128,
-      normalize: true,
-      latency: 'balanced',
-    };
+    console.log('[Voice] Calling ElevenLabs...', { textLen: shortText.length, voice: voiceId, lang });
 
-    // Voice-ID: Wenn gesetzt, nutze die gewählte Stimme (Sarah)
-    if (FISH_AUDIO_VOICE) {
-      ttsBody.reference_id = FISH_AUDIO_VOICE;
-    }
-
-    console.log('[Voice] Calling Fish Audio...', { textLen: shortText.length, voice: FISH_AUDIO_VOICE || 'default' });
-
+    // ── ElevenLabs Text-to-Speech API ──
+    // Model: eleven_multilingual_v2 – erkennt Sprache automatisch
     const ttsRes = await fetch(
-      'https://api.fish.audio/v1/tts',
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${FISH_AUDIO_KEY}`,
+          'xi-api-key': ELEVENLABS_KEY,
         },
-        body: JSON.stringify(ttsBody),
+        body: JSON.stringify({
+          text: shortText,
+          model_id: 'eleven_multilingual_v2',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.3,
+            use_speaker_boost: true,
+          },
+        }),
       }
     );
 
     if (!ttsRes.ok) {
       const err = await ttsRes.text();
-      console.error('[Voice] Fish Audio error:', ttsRes.status, err);
+      console.error('[Voice] ElevenLabs error:', ttsRes.status, err);
       return res.status(500).json({ error: 'TTS failed', detail: err });
     }
 
