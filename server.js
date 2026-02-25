@@ -705,14 +705,11 @@ app.post('/api/whatsapp', async (req, res) => {
       }
     }
 
-    // Auto-Subscribe bei WordPress
-    const phoneLang = detectLangFromPhone(from);
-    try {
-      await fetch(`${SITE_URL}/wp-json/mdr-chatbot/v1/wa/subscribe`, {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({phone:from, name:name, lang:phoneLang}), timeout:5000,
-      });
-    } catch(e) {}
+    // FIX v4.3.3: Auto-Subscribe entfernt!
+    // WordPress handle_webhook() ruft auto_subscribe() + track() bereits auf.
+    // Der zusätzliche Railway → WordPress /wa/subscribe Callback war redundant
+    // und verursachte 3x update_option pro Nachricht (statt 2x).
+    // Bei vielen gleichzeitigen Nachrichten: PHP-Worker-Exhaustion.
 
     // Conversation History – Name und Sprache merken
     if (!waConversations.has(from)) {
@@ -838,19 +835,23 @@ app.post('/api/wa/broadcast', async (req, res) => {
       }
     }
     else if (type === 'weekly_affiliate') {
-      for (const sub of subscribers) {
-        const phone = sub.phone || sub;
-        const lang = sub.lang || 'en';
+      // FIX v4.3.3: DeepSeek nur 1x PRO SPRACHE aufrufen, nicht pro Subscriber!
+      // Vorher: 100 Subscriber = 100 API-Calls = 500s Blockade
+      // Nachher: Max 5 API-Calls (5 Sprachen) = 25s
+      const aiMsgCache = {}; // lang → message
+
+      // Schritt 1: Für jede vorkommende Sprache EINE Nachricht generieren
+      const langs = [...new Set(subscribers.map(s => s.lang || 'en'))];
+      for (const lang of langs) {
         try {
-          let msg = '';
           if (pinned_product && pinned_product.trim()) {
-            msg = buildPinnedProductMsg(pinned_product, lang);
+            aiMsgCache[lang] = buildPinnedProductMsg(pinned_product, lang);
           } else {
             const allRecipes = await getRecipes();
             const latest = allRecipes.slice(0,3).map(r=>r.title).join(', ');
             const langInstructions = {
               de:'auf Deutsch',en:'in English',
-              fr:'en français',es:'en español',
+              fr:'en français',es:'en español',pt:'em português',
             };
             const aiRes = await fetch(DEEPSEEK_URL, {
               method:'POST',
@@ -865,10 +866,22 @@ app.post('/api/wa/broadcast', async (req, res) => {
               }),
             });
             const aiData = await aiRes.json();
-            msg = aiData.choices?.[0]?.message?.content || '';
+            aiMsgCache[lang] = aiData.choices?.[0]?.message?.content || '';
           }
+        } catch(e) {
+          console.error(`[WA Affiliate] AI failed for ${lang}:`, e.message);
+          aiMsgCache[lang] = '';
+        }
+      }
+
+      // Schritt 2: Generierte Nachrichten an alle Subscriber senden
+      for (const sub of subscribers) {
+        const phone = sub.phone || sub;
+        const lang = sub.lang || 'en';
+        try {
+          let msg = aiMsgCache[lang] || aiMsgCache['en'] || '';
           if (msg) {
-            const stopMsg = {de:'"stop" zum Abmelden',en:'"stop" to unsubscribe',fr:'"stop" pour se désabonner',es:'"stop" para cancelar'};
+            const stopMsg = {de:'"stop" zum Abmelden',en:'"stop" to unsubscribe',fr:'"stop" pour se désabonner',es:'"stop" para cancelar',pt:'"stop" para cancelar'};
             msg += `\n\n_${stopMsg[lang]||stopMsg.en}_`;
             await sendWhatsApp(phone, msg);
             sent++;
