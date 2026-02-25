@@ -727,11 +727,13 @@ app.post('/api/whatsapp', async (req, res) => {
 
     // Sprache: erst aus Text erkennen, Fallback gespeichert, dann Vorwahl
     const textLang = detectLang(userText);
+    const phoneLang = detectLangFromPhone(from);
     const lang = textLang || conv.userLang || phoneLang;
     if (textLang) conv.userLang = textLang; // Sprache merken
 
     // AI Antwort
     const systemPrompt = await buildSystemPrompt(lang, '', false);
+    const botName = brandingCache.bot_name || 'Lily';
     const userName = conv.userName || name || '';
     const msgCount = conv.msgs.filter(m => m.role === 'user').length;
     const waSystemPrompt = systemPrompt + `
