@@ -125,21 +125,24 @@ setInterval(() => {
 
 // ─── KONFIGURATION (alle aus ENV-Variablen) ──────────────
 const PORT = process.env.PORT || 3000;                        // Railway setzt PORT automatisch
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;            // DeepSeek AI API Key
-const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions'; // DeepSeek Chat Endpoint
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat'; // Modell (default: deepseek-chat)
-const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com'; // WordPress-Domain
-const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`; // Rezepte REST-API
-const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';    // Produkte-API (optional, für Affiliate)
-const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';    // ElevenLabs TTS API Key
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || ''; // ElevenLabs Voice ID
+// FIX v4.3.3: Akzeptiert BEIDE Namenskonventionen (Doku + Code)
+const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY || process.env.DEEPSEEK_KEY || '';
+const DEEPSEEK_URL = 'https://api.deepseek.com/v1/chat/completions';
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+const SITE_URL = process.env.SITE_URL || 'https://mydishrecipes.com';
+const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/recipes`;
+const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVENLABS_KEY || '';
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || '';
 const FISH_AUDIO_KEY = process.env.FISH_AUDIO_API_KEY || '';    // Fish Audio TTS API Key
 const FISH_AUDIO_VOICE = process.env.FISH_AUDIO_VOICE_ID || ''; // Fish Audio Voice ID
 
 // WhatsApp Meta Cloud API Credentials
-const META_WA_TOKEN = process.env.META_WA_TOKEN || '';         // Permanenter System User Token
-const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || '';   // WhatsApp Business Phone Number ID
-const META_WA_VERIFY = process.env.META_WA_VERIFY || 'mdr_verify_token'; // Webhook Verify Token
+// FIX v4.3.3: Akzeptiert BEIDE Namenskonventionen (Doku + Code)
+// Doku: WA_TOKEN, WA_PHONE_ID  |  Code: META_WA_TOKEN, META_WA_PHONE_ID
+const META_WA_TOKEN = process.env.META_WA_TOKEN || process.env.WA_TOKEN || '';
+const META_WA_PHONE_ID = process.env.META_WA_PHONE_ID || process.env.WA_PHONE_ID || '';
+const META_WA_VERIFY = process.env.META_WA_VERIFY || process.env.WA_VERIFY || 'mdr_verify_token';
 
 // ─── WHATSAPP CONVERSATION MEMORY ────────────────────────
 // In-Memory Map: Telefonnummer → { msgs[], ts, userName, userLang, dailyCount, ... }
@@ -1139,9 +1142,16 @@ app.get('/api/recipes', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`
   ┌──────────────────────────────────────┐
-  │  🍽️  My Dish Recipes Chatbot v4.2    │
+  │  🍽️  My Dish Recipes Chatbot v4.3.3  │
   │  Port: ${PORT}                             │
   │  API:  ${WP_API.slice(0, 32)}...  │
-  │  WA:   ${META_WA_TOKEN ? '✅ Connected' : '❌ Not configured'}              │
-  └──────────────────────────────────────┘`);
+  └──────────────────────────────────────┘
+  ENV-Status:
+    DeepSeek:    ${DEEPSEEK_KEY ? '✅ Key gesetzt' : '❌ FEHLT! (DEEPSEEK_API_KEY oder DEEPSEEK_KEY)'}
+    ElevenLabs:  ${ELEVENLABS_KEY ? '✅ Key gesetzt' : '⚠️  Nicht gesetzt (Voice-Fallback: Browser)'}
+    WA Token:    ${META_WA_TOKEN ? '✅ Token gesetzt' : '❌ FEHLT! (META_WA_TOKEN oder WA_TOKEN)'}
+    WA Phone ID: ${META_WA_PHONE_ID ? '✅ ID gesetzt' : '❌ FEHLT! (META_WA_PHONE_ID oder WA_PHONE_ID)'}
+    WA Verify:   ${META_WA_VERIFY}
+    Site URL:    ${SITE_URL}
+  `);
 });
