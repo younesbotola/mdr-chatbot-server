@@ -1,46 +1,78 @@
 // ═══════════════════════════════════════════════════════════
-// My Dish Recipes – Chatbot Backend v4.2
+// My Dish Recipes – Chatbot Backend v4.3
 // Autor: Younes Biane | mydishrecipes.com
 // ═══════════════════════════════════════════════════════════
 //
-// ARCHITEKTUR-ÜBERSICHT:
+// ╔═════════════════════════════════════════════════════════╗
+// ║  FÜR CLAUDE-CHATS:                                    ║
+// ║                                                       ║
+// ║  Diese Datei läuft auf Railway (Node.js), NICHT auf   ║
+// ║  dem WordPress-Server! Änderungen hier müssen per     ║
+// ║  Git-Push auf Railway deployed werden.                ║
+// ║                                                       ║
+// ║  SPRACHEN v4.3.0: de, en, fr, es, pt                 ║
+// ║  ENTFERNT: tr, ar                                     ║
+// ║                                                       ║
+// ║  Sprache hinzufügen? Stellen in DIESER Datei:         ║
+// ║  1. langMap{} (~Z.287): Sprach-Anweisung hinzufügen  ║
+// ║  2. buildSystemPrompt() (~Z.340): Grammatik-Hinweis  ║
+// ║  3. WhatsApp langMap (~Z.1005): Vorwahl→Sprache      ║
+// ║                                                       ║
+// ║  ENV-VARIABLEN (Railway):                             ║
+// ║  DEEPSEEK_KEY, ELEVENLABS_KEY, WA_TOKEN, WA_PHONE_ID ║
+// ║  WP_API_URL, SITE_URL, BOT_NAME, BOT_EMOJI           ║
+// ╚═════════════════════════════════════════════════════════╝
+//
+// ARCHITEKTUR:
 // ─────────────────────────────────────────────────────────
-// Dieses Backend läuft auf Railway (Node.js) und bedient:
+// 1. WEB-CHAT    POST /api/chat       → DeepSeek AI → JSON
+// 2. WHATSAPP    POST /api/whatsapp   → Meta Cloud API
+// 3. VOICE TTS   POST /api/voice      → ElevenLabs → MP3
+// 4. STATS       GET  /api/stats      → Admin-Dashboard
+// 5. HEALTH      GET  /api/health     → Server-Status
+// 6. BROADCAST   POST /api/wa/broadcast → Wöchentl. WhatsApp
 //
-//   1. WEB-CHAT    POST /api/chat      → DeepSeek AI → JSON { reply }
-//   2. WHATSAPP    POST /api/whatsapp   → Meta Cloud API Webhook
-//   3. VOICE       POST /api/voice      → ElevenLabs TTS → Audio MP3
-//   4. STATS       GET  /api/stats      → Nutzungszahlen für Admin-Dashboard
-//   5. HEALTH      GET  /api/health     → Server-Status
-//   6. BROADCAST   POST /api/wa/broadcast → Wöchentliche Rezepte/Affiliate per WhatsApp
-//
-// DATENFLUSS:
-//   WordPress Plugin → REST API → Rezepte-Cache hier → DeepSeek AI Prompt
-//   User-Nachricht → Rate Limit → Input Sanitize → AI → Antwort
+// VOICE-FLOW (ElevenLabs):
+//   Userin spricht/tippt → /api/chat (voiceMode:true) → AI-Text
+//   → /api/voice → ElevenLabs Multilingual v2 → MP3 Audio → Browser
+//   → Fallback: Browser SpeechSynthesis (weibliche Stimme)
 //
 // REZEPT-LOGIK (3 Stufen):
-//   Stufe 1: Rezept auf unserer Seite → Link zur Seite
-//   Stufe 2: User will Details → Zutaten + Schritte im Chat + Link
+//   Stufe 1: Rezept auf unserer Seite → Link + [RECIPE] Card
+//   Stufe 2: Userin will Details → Zutaten + Schritte + Link
 //   Stufe 3: Rezept NICHT bei uns → Allgemeines Rezept, KEINE fremden Links
 //
-// ENV-VARIABLEN (Railway Settings):
-//   DEEPSEEK_API_KEY    – DeepSeek Chat API Key
-//   SITE_URL            – WordPress Domain (z.B. https://mydishrecipes.com)
-//   WP_API_URL          – Rezepte-Endpoint (z.B. .../wp-json/mdr-chatbot/v1/recipes)
-//   META_WA_TOKEN       – Meta WhatsApp Business API Token
-//   META_WA_PHONE_ID    – WhatsApp Phone Number ID
-//   META_WA_VERIFY      – Webhook Verify Token
-//   FISH_AUDIO_API_KEY  – (VERALTET, ersetzt durch ElevenLabs)
-//   FISH_AUDIO_VOICE_ID – (VERALTET, ersetzt durch ElevenLabs)
-//   ELEVENLABS_API_KEY  – ElevenLabs TTS API Key
-//   ELEVENLABS_VOICE_ID – ElevenLabs Voice ID
-//   AMAZON_PRODUCTS_URL – Produkte-API (optional)
+// WHATSAPP-BROADCAST:
+//   - Timezone-aware: Sendet nur 8:00-21:00 Ortszeit
+//   - Duplicate-Lock: 30 Min globaler Lock pro Broadcast-Typ
+//   - Personalisiert: Subscriber-Name + Sprache nach Vorwahl
+//
+// ENV-VARIABLEN (Railway Settings > Variables):
+//   ┌─────────────────────────┬──────────────────────────────────────────┐
+//   │ DEEPSEEK_API_KEY        │ DeepSeek Chat API Key                    │
+//   │ DEEPSEEK_MODEL          │ Modell (default: deepseek-chat)          │
+//   │ SITE_URL                │ WordPress Domain                         │
+//   │ WP_API_URL              │ Rezepte REST-Endpoint                    │
+//   │ ELEVENLABS_API_KEY      │ ElevenLabs TTS API Key                   │
+//   │ ELEVENLABS_VOICE_ID     │ ElevenLabs Stimme (z.B. Sarah)           │
+//   │ FISH_AUDIO_API_KEY      │ Fish Audio TTS API Key (Alternative)     │
+//   │ FISH_AUDIO_VOICE_ID     │ Fish Audio Voice ID (Alternative)        │
+//   │ META_WA_TOKEN           │ Meta WhatsApp Business Token              │
+//   │ META_WA_PHONE_ID        │ WhatsApp Phone Number ID                  │
+//   │ META_WA_VERIFY          │ Webhook Verify Token                      │
+//   │ AMAZON_PRODUCTS_URL     │ Produkte-API (optional)                   │
+//   └─────────────────────────┴──────────────────────────────────────────┘
 //
 // SICHERHEIT:
 //   - Rate Limit: 20 req/min pro IP (Web-Chat + Voice)
 //   - Body Limit: 50kb max
-//   - Input: Max 2000 Zeichen pro Nachricht, max 30 Messages
+//   - Input: Max 2000 Zeichen/Nachricht, max 30 Messages/Session
 //   - Sessions: Validierung von sessionId (Länge < 100)
+//   - WhatsApp: 50 Nachrichten/Tag pro Nummer
+//
+// DEPLOYMENT:
+//   GitHub → Railway (Auto-Deploy bei git push)
+//   Plugin → WordPress Admin > Plugins > ZIP hochladen
 // ═══════════════════════════════════════════════════════════
 
 // ─── ABHÄNGIGKEITEN ──────────────────────────────────────
@@ -101,6 +133,8 @@ const WP_API = process.env.WP_API_URL || `${SITE_URL}/wp-json/mdr-chatbot/v1/rec
 const PRODUCTS_API = process.env.AMAZON_PRODUCTS_URL || '';    // Produkte-API (optional, für Affiliate)
 const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || '';    // ElevenLabs TTS API Key
 const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE_ID || ''; // ElevenLabs Voice ID
+const FISH_AUDIO_KEY = process.env.FISH_AUDIO_API_KEY || '';    // Fish Audio TTS API Key
+const FISH_AUDIO_VOICE = process.env.FISH_AUDIO_VOICE_ID || ''; // Fish Audio Voice ID
 
 // WhatsApp Meta Cloud API Credentials
 const META_WA_TOKEN = process.env.META_WA_TOKEN || '';         // Permanenter System User Token
@@ -198,7 +232,20 @@ getBranding();
 // Branding alle 30 Min refreshen
 setInterval(getBranding, 30 * 60 * 1000);
 
-// ─── SYSTEM PROMPT ──────────────────────────────────────
+// ─── SYSTEM PROMPT (KERN des AI-Verhaltens) ─────────────
+// Diese Funktion baut den gesamten System-Prompt für DeepSeek AI.
+// Hier wird definiert WER Lily ist, WIE sie spricht, und WELCHE Rezepte sie kennt.
+// 
+// Prompt-Struktur:
+//   1. Identität (persönliche Assistentin, nicht Mensch, nicht AI)
+//   2. Geschlecht & Grammatik (weiblich, 6 Sprachen)
+//   3. Sprache (auto-detect, GTranslate)
+//   4. Persönlichkeit (warm, freundlich, ermutigend)
+//   5. Rezept-Logik (3 Stufen: Link → Details → Allgemein)
+//   6. Rezeptliste (aus WordPress REST API, cached)
+//   7. Produkt-Integration (Amazon Affiliate, optional)
+//
+// ÄNDERN: Wenn Lily anders sprechen soll → hier anpassen.
 async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const recipes = await getRecipes();
   const { bot_name: botName, bot_emoji: botEmoji, blog_name: blogName } = brandingCache;
@@ -254,10 +301,9 @@ async function buildSystemPrompt(lang, pageTitle, isRecipe) {
   const langMap = {
     de: 'Antworte immer auf Deutsch.',
     en: 'Always reply in English.',
-    tr: 'Her zaman Türkçe cevap ver.',
-    ar: 'أجب دائماً بالعربية.',
     fr: 'Réponds toujours en français.',
     es: 'Responde siempre en español.',
+    pt: 'Responde sempre em português.',
   };
 
   // Kontext: User ist auf einer bestimmten Rezeptseite
@@ -305,14 +351,13 @@ GESCHLECHT & GRAMMATIK (SEHR WICHTIG für alle Sprachen!):
 - Du (${botName}) bist WEIBLICH. Sprich IMMER in weiblicher Form über dich selbst.
 - Deine Userinnen sind hauptsächlich FRAUEN. Sprich sie in weiblicher Form an.
 - Das gilt für JEDE Sprache – besonders wichtig für:
-  • Arabisch: Nutze die weibliche Anrede (أنتِ nicht أنت), weibliche Verbformen (تريدين, تحبين, جربي)
-  • Türkisch: Grammatik ist geschlechtsneutral, aber nutze weibliche Kosenamen (güzelim, canım, tatlım)
+  • Deutsch: Weibliche Anrede (Liebe, Süße) – du bist eine Köchin, Freundin, Assistentin
+  • Englisch: Geschlechtsneutral ist OK, aber nutze weibliche Wärme (sweetie, lovely)
   • Französisch: Weibliche Formen (tu es prête?, ma chère, ta recette préférée)
   • Spanisch: Weibliche Formen (¿estás lista?, querida, tu receta favorita)
-  • Deutsch: Weibliche Anrede (Liebe, Süße) – du bist eine Köchin, Freundin, Assistentin
-  • Englisch: Geschlechtsneutral ist OK, aber nutze weibliche Wärme (sweetie, lovely, babe)
-- Über dich selbst: "Ich bin begeistert!" nicht "Ich bin begeistert" (du bist eine Frau)
-- Beispiele: "Hast du Lust auf...?" / "هل تحبين...؟" / "¿Te gustaría...?" / "Tu veux...?"
+  • Portugiesisch: Formas femininas (estás pronta?, querida, a tua receita favorita)
+- Über dich selbst: "Ich bin begeistert!" (du bist eine Frau)
+- Beispiele: "Hast du Lust auf...?" / "¿Te gustaría...?" / "Tu veux...?"
 
 SPRACHE:
 - Die Startsprache ist: ${langMap[lang] || langMap.en}
@@ -420,8 +465,16 @@ async function callAI(messages, lang, pageTitle, isRecipe) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: Web Chat (mit Session-Tracking)
+// ROUTE: POST /api/chat – Web-Chat + Voice-Chat
 // ═══════════════════════════════════════════════════════════
+// Empfängt: { messages[], lang, pageTitle, isRecipe, sessionId, voiceMode }
+// Gibt zurück: { reply: "AI Antwort" }
+//
+// Session-Tracking: Speichert Konversation per sessionId (1h TTL).
+// Jede neue Nachricht wird an die Session angehängt → AI hat Kontext.
+// voiceMode: true → Stats werden als Voice gezählt statt Web.
+//
+// Flow: Nachricht → Session laden → AI Prompt bauen → DeepSeek → Antwort
 const webSessions = new Map(); // sessionId → { msgs, ts }
 const WEB_SESSION_TTL = 60 * 60 * 1000; // 1 Stunde
 
@@ -485,49 +538,61 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: Voice TTS (ElevenLabs Multilingual v2)
-// Auto-erkennt die Sprache aus dem Text → perfekt für 6+ Sprachen
+// ROUTE: POST /api/voice – ElevenLabs Text-to-Speech
 // ═══════════════════════════════════════════════════════════
+// Empfängt: { text, lang }
+// Gibt zurück: audio/mpeg (MP3 Buffer)
+//
+// Modell: eleven_multilingual_v2 → erkennt Sprache automatisch aus Text
+// Voice: Aus ENV ELEVENLABS_VOICE_ID (Default: Sarah = EXAVITQu4vr4xnSDxMaL)
+// Max 500 Zeichen pro Request (Kostenkontrolle)
+// Bei Fehler: Client fällt auf Browser SpeechSynthesis zurück
 app.post('/api/voice', async (req, res) => {
   try {
-    const { text, lang } = req.body;
-    if (!text || !ELEVENLABS_KEY) {
-      console.error('[Voice] Not configured. Key:', !!ELEVENLABS_KEY, 'Voice:', ELEVENLABS_VOICE);
-      return res.status(400).json({ error: 'Voice not configured' });
-    }
+    const { text, lang, provider } = req.body;
+    const useFish = provider === 'fishaudio';
+
+    // Prüfe ob der gewählte Provider konfiguriert ist
+    if (!text) return res.status(400).json({ error: 'No text' });
+    if (useFish && !FISH_AUDIO_KEY) return res.status(400).json({ error: 'Fish Audio not configured' });
+    if (!useFish && !ELEVENLABS_KEY) return res.status(400).json({ error: 'ElevenLabs not configured' });
 
     // Kürze Text auf max 500 Zeichen (Kostenkontrolle)
     const shortText = text.slice(0, 500);
-    const voiceId = ELEVENLABS_VOICE || 'EXAVITQu4vr4xnSDxMaL'; // Default: Sarah
+    let ttsRes;
 
-    console.log('[Voice] Calling ElevenLabs...', { textLen: shortText.length, voice: voiceId, lang });
+    if (useFish) {
+      // ── Fish Audio TTS ──
+      const voiceId = FISH_AUDIO_VOICE;
+      console.log('[Voice] Fish Audio...', { textLen: shortText.length, voice: voiceId || 'default' });
 
-    // ── ElevenLabs Text-to-Speech API ──
-    // Model: eleven_multilingual_v2 – erkennt Sprache automatisch
-    const ttsRes = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
+      const ttsBody = { text: shortText, format: 'mp3', mp3_bitrate: 128, normalize: true, latency: 'balanced' };
+      if (voiceId) ttsBody.reference_id = voiceId;
+
+      ttsRes = await fetch('https://api.fish.audio/v1/tts', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'xi-api-key': ELEVENLABS_KEY,
-        },
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${FISH_AUDIO_KEY}` },
+        body: JSON.stringify(ttsBody),
+      });
+    } else {
+      // ── ElevenLabs Multilingual v2 (Default) ──
+      const voiceId = ELEVENLABS_VOICE || 'EXAVITQu4vr4xnSDxMaL'; // Default: Sarah
+      console.log('[Voice] ElevenLabs...', { textLen: shortText.length, voice: voiceId, lang });
+
+      ttsRes = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'xi-api-key': ELEVENLABS_KEY },
         body: JSON.stringify({
           text: shortText,
           model_id: 'eleven_multilingual_v2',
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-            style: 0.3,
-            use_speaker_boost: true,
-          },
+          voice_settings: { stability: 0.5, similarity_boost: 0.75, style: 0.3, use_speaker_boost: true },
         }),
-      }
-    );
+      });
+    }
 
     if (!ttsRes.ok) {
       const err = await ttsRes.text();
-      console.error('[Voice] ElevenLabs error:', ttsRes.status, err);
+      console.error(`[Voice] ${useFish ? 'Fish Audio' : 'ElevenLabs'} error:`, ttsRes.status, err);
       return res.status(500).json({ error: 'TTS failed', detail: err });
     }
 
@@ -545,8 +610,16 @@ app.post('/api/voice', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════
-// ROUTE: WhatsApp Webhook (Meta Cloud API)
+// ROUTE: WhatsApp (Meta Cloud API)
 // ═══════════════════════════════════════════════════════════
+// GET  /api/whatsapp → Webhook Verification (Meta prüft einmalig)
+// POST /api/whatsapp → Eingehende Nachrichten von Userinnen
+// POST /api/wa/broadcast → Broadcasts (Rezepte/Affiliate, von WP-Cron)
+//
+// Konversation: In-Memory Map (Telefon → {msgs[], userName, userLang})
+// Limit: 50 Nachrichten/Tag pro Nummer, 20 History Messages
+// Sprache: Auto-detect aus Text, Fallback aus Vorwahl
+// Broadcasts: Timezone-aware (8:00-21:00 Ortszeit), Duplicate-Lock 30 Min
 
 // Webhook Verification (GET)
 app.get('/api/whatsapp', (req, res) => {
@@ -623,8 +696,6 @@ app.post('/api/whatsapp', async (req, res) => {
           const limitMsgs = {
             de: `⏳ Du hast dein Tageslimit von ${settings.chatLimit} Nachrichten erreicht. Morgen geht es weiter!`,
             en: `⏳ You've reached your daily limit of ${settings.chatLimit} messages. Try again tomorrow!`,
-            tr: `⏳ Günlük ${settings.chatLimit} mesaj limitine ulaştınız. Yarın tekrar deneyin!`,
-            ar: `⏳ لقد وصلت إلى الحد اليومي (${settings.chatLimit} رسالة). حاول مرة أخرى غداً!`,
             fr: `⏳ Vous avez atteint votre limite de ${settings.chatLimit} messages. Réessayez demain !`,
             es: `⏳ Has alcanzado tu límite de ${settings.chatLimit} mensajes. ¡Inténtalo mañana!`,
           };
@@ -668,7 +739,7 @@ app.post('/api/whatsapp', async (req, res) => {
 WHATSAPP-MODUS:
 - Du antwortest via WhatsApp, NICHT im Web-Chat
 - WICHTIG: Antworte IMMER in der Sprache der letzten Nachricht!
-- Wenn User Deutsch schreibt → Deutsch. Englisch → Englisch. Türkisch → Türkisch. Etc.
+- Wenn User Deutsch schreibt → Deutsch. Englisch → Englisch. Französisch → Französisch. Etc.
 - Halte Antworten KURZ (max 3-4 Sätze)
 - KEINE [RECIPE], [SHOPLIST], [PRODUCT] Tags – nur einfacher Text
 - Rezept-Links IMMER als vollständige URL mit Domain: ${SITE_URL}/rezept-slug/
@@ -690,7 +761,7 @@ ${isFirstContact ? '- ERSTER KONTAKT: Begrüße sie herzlich, stelle dich als ih
 - WICHTIG: Lies den bisherigen Chat-Verlauf genau! Wenn sie vorher etwas erwähnt hat (Zutaten, Vorlieben, Allergien, Geräte), erinnere dich daran und nutze es.
 - Wenn sie z.B. gesagt hat "ich habe Hähnchen" und jetzt fragt "was noch?" → beziehe dich auf das Hähnchen!
 - Merke dir Vorlieben: Wenn jemand sagt "ich bin Vegetarierin" oder "kein Schwein" → respektiere das in ALLEN folgenden Antworten
-- GESCHLECHT: Du (${botName}) bist weiblich. Sprich die Userin in weiblicher Form an. Arabisch: أنتِ + weibliche Verben. Französisch/Spanisch: weibliche Formen.
+- GESCHLECHT: Du (${botName}) bist weiblich. Sprich die Userin in weiblicher Form an. Französisch/Spanisch/Portugiesisch: weibliche Formen.
 - Sei warm, persönlich und wie eine beste Freundin die gerne kocht`;
 
     const aiRes = await fetch(DEEPSEEK_URL, {
@@ -778,7 +849,7 @@ app.post('/api/wa/broadcast', async (req, res) => {
             const allRecipes = await getRecipes();
             const latest = allRecipes.slice(0,3).map(r=>r.title).join(', ');
             const langInstructions = {
-              de:'auf Deutsch',en:'in English',tr:'Türkçe',ar:'بالعربية',
+              de:'auf Deutsch',en:'in English',
               fr:'en français',es:'en español',
             };
             const aiRes = await fetch(DEEPSEEK_URL, {
@@ -797,7 +868,7 @@ app.post('/api/wa/broadcast', async (req, res) => {
             msg = aiData.choices?.[0]?.message?.content || '';
           }
           if (msg) {
-            const stopMsg = {de:'"stop" zum Abmelden',en:'"stop" to unsubscribe',tr:'"stop" abonelikten çıkmak için',ar:'"stop" لإلغاء الاشتراك',fr:'"stop" pour se désabonner',es:'"stop" para cancelar'};
+            const stopMsg = {de:'"stop" zum Abmelden',en:'"stop" to unsubscribe',fr:'"stop" pour se désabonner',es:'"stop" para cancelar'};
             msg += `\n\n_${stopMsg[lang]||stopMsg.en}_`;
             await sendWhatsApp(phone, msg);
             sent++;
@@ -857,8 +928,6 @@ function buildRecipeBroadcast(recipes, lang, botName, subscriberName) {
   const intros = {
     de: `Hey${firstName ? ' ' + firstName : ' Liebes'}! 💕 Hier ist ${bot} mit frischen Rezept-Ideen für dich:`,
     en: `Hey${firstName ? ' ' + firstName : ' lovely'}! 💕 It's ${bot} with fresh recipe ideas for you:`,
-    tr: `Merhaba${firstName ? ' ' + firstName : ' güzelim'}! 💕 ${bot} senin için taze tarif fikirleriyle burada:`,
-    ar: `${firstName ? firstName + ' ' : 'حبيبتي '}مرحبا! 💕 أنا ${bot} مع أفكار وصفات طازجة لك:`,
     fr: `Coucou${firstName ? ' ' + firstName : ' ma belle'} ! 💕 C'est ${bot} avec de nouvelles idées :`,
     es: `¡Hola${firstName ? ' ' + firstName : ' guapa'}! 💕 Soy ${bot} con ideas frescas de recetas:`,
   };
@@ -866,8 +935,6 @@ function buildRecipeBroadcast(recipes, lang, botName, subscriberName) {
   const footers = {
     de: `\n💬 _Antworte einfach mit einer Nummer für Details!_\n\n_"stop" zum Abmelden_`,
     en: `\n💬 _Reply with a number for details!_\n\n_"stop" to unsubscribe_`,
-    tr: `\n💬 _Detaylar için bir numara ile yanıtlayın!_\n\n_"stop" abonelikten çıkmak için_`,
-    ar: `\n💬 _رد برقم للتفاصيل!_\n\n_"stop" لإلغاء الاشتراك_`,
     fr: `\n💬 _Répondez avec un numéro pour les détails !_\n\n_"stop" pour se désabonner_`,
     es: `\n💬 _Responde con un número para detalles!_\n\n_"stop" para cancelar_`,
   };
@@ -897,8 +964,6 @@ function buildPinnedProductMsg(pinned, lang) {
   const intros = {
     de:`💡 *Küchentipp der Woche:* ${name}`,
     en:`💡 *Kitchen tip of the week:* ${name}`,
-    tr:`💡 *Haftanın mutfak ipucu:* ${name}`,
-    ar:`💡 *نصيحة المطبخ هذا الأسبوع:* ${name}`,
     fr:`💡 *Astuce cuisine de la semaine :* ${name}`,
     es:`💡 *Consejo de cocina de la semana:* ${name}`,
   };
@@ -951,14 +1016,14 @@ function detectLangFromPhone(phone) {
   const map = {
     '49':'de','43':'de','41':'de',
     '1':'en','44':'en','61':'en',
-    '90':'tr',
-    '966':'ar','971':'ar','20':'ar','212':'ar','213':'ar','216':'ar',
+    '90':'en', // Türkei → Englisch als Fallback
+    '966':'en','971':'en','20':'en','212':'en','213':'en','216':'en', // Arab. Länder → Englisch
     '33':'fr','32':'fr',
     '34':'es','52':'es','54':'es',
-    '55':'pt','351':'pt',
-    '39':'it','31':'nl',
-    '81':'ja','82':'ko','86':'zh',
-    '91':'hi','62':'id','66':'th',
+    '55':'pt','351':'pt', // Portugiesisch → Portugiesisch
+    '39':'en','31':'en',
+    '81':'en','82':'en','86':'en',
+    '91':'en','62':'en','66':'en',
   };
   for (const len of [3,2,1]) {
     const pre = clean.substring(0, len);
@@ -973,10 +1038,8 @@ function detectLangFromPhone(phone) {
 function detectLang(text) {
   const t = (text || '').toLowerCase();
   if (/[äöüß]|hallo|bitte|danke|rezept/i.test(t)) return 'de';
-  if (/[şçğıö]|merhaba|tarif/i.test(t)) return 'tr';
-  if (/[\u0600-\u06FF]/.test(t)) return 'ar';
-  if (/bonjour|recette|merci/i.test(t)) return 'fr';
-  if (/hola|receta|gracias/i.test(t)) return 'es';
+  if (/bonjour|recette|merci|[éèêàâùûçœ]/i.test(t)) return 'fr';
+  if (/hola|receta|gracias|[ñ¿¡]/i.test(t)) return 'es';
   return 'en';
 }
 
